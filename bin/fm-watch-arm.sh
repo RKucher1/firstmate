@@ -160,7 +160,7 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-"$WATCH" >"$child_out" &
+setsid "$WATCH" >"$child_out" 2>&1 </dev/null &
 child=$!
 child_done=0
 
@@ -171,12 +171,19 @@ deadline=$(( $(date +%s) + CONFIRM_TIMEOUT ))
 while :; do
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
-      echo "watcher: started pid=$child (beacon fresh)"
-      wait "$child"
-      rc=$?
+      echo "watcher: started pid=$child (beacon fresh, detached)"
+      # Do NOT wait on the watcher: it is a perpetual daemon, so a wait here blocked
+      # fm-watch-arm forever, which left the captain's Claude Code background task
+      # tracked as "1 shell still running" and the terminal never reached a clean done
+      # state (FM-WATCH-DETACH-1). setsid (at launch) detaches the watcher into its own
+      # session so it survives this arm process exiting; disown drops it from job
+      # control. The singleton lockfile + fm-guard remain the source of truth for
+      # liveness/restart, so supervision is unchanged — only the captain's shell-tracking
+      # is freed.
+      disown "$child" 2>/dev/null || true
       print_watch_output "$child_out"
       rm -f "$child_out" 2>/dev/null || true
-      exit "$rc"
+      exit 0
     fi
     # Another watcher won the singleton; our child stood down. Report the live one.
     report_healthy
