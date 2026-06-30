@@ -11,7 +11,14 @@
 # all retries), fm-send exits NON-ZERO so the caller knows the steer did not land
 # instead of silently leaving an unsubmitted instruction (incident afk-invx-i5).
 # The composer/submit logic is shared with the away-mode daemon via
-# bin/fm-tmux-lib.sh. Tune with FM_SEND_RETRIES (default 3) / FM_SEND_SLEEP (0.4).
+# bin/fm-tmux-lib.sh. Tune with FM_SEND_RETRIES (default 8) / FM_SEND_SLEEP (0.5).
+# The retry budget is deliberately generous (~4s of Enter retries): against a
+# claude TUI showing the bypass-permissions footer the first Enter(s) after a
+# programmatic text injection are reliably swallowed for longer than a couple of
+# attempts, then a later Enter lands (incident afk-invx-i5 / F3 regression). A
+# short budget returned a false "Enter swallowed" while a manual follow-up Enter
+# submitted the already-typed text. Keeping the loop retrying Enter (never the
+# text) until the composer truly clears makes a single fm-send land the steer.
 # Slash commands, and codex `$...` skill invocations resolved through harness
 # meta, get a longer pre-Enter settle so completion popups do not swallow Enter.
 #
@@ -110,8 +117,8 @@ else
       ;;
     *) settle=0.3 ;;
   esac
-  retries=${FM_SEND_RETRIES:-3}
-  sleep_s=${FM_SEND_SLEEP:-0.4}
+  retries=${FM_SEND_RETRIES:-8}
+  sleep_s=${FM_SEND_SLEEP:-0.5}
   # Type once, submit, verify. Lenient: only a positively-confirmed swallow
   # (text still in the composer) is an error; an unreadable pane is assumed sent.
   verdict=$(fm_tmux_submit_core "$T" "$MARK_PREFIX$*" "$retries" "$sleep_s" "$settle")
