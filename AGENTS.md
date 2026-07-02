@@ -475,6 +475,7 @@ The printed reason line is still useful, but the drained queue is the lossless b
 **Keep exactly one live cycle.**
 The arm chain IS the supervision: while any task is in flight, keep exactly one live `bin/fm-watch-arm.sh` background task at all times, because if no cycle is live firstmate is blind.
 Each cycle is one harness-tracked background task that blocks until an actionable wake is due (benign wakes are absorbed in bash without ending the task), fires with one reason line, and ends, so the chain survives only when firstmate starts the next cycle after each fire.
+Mechanically, the watcher process itself runs detached (its own session, reparented to init - never a live child of the arm or of your shell, so harness shell-tracking cannot hang on it), and the arm blocks on it logically - polling the identity-checked lock and the watcher's captured output - so the tracked task still completes exactly when a wake fires.
 After handling the drained wakes, re-arm before you end the turn by running `bin/fm-watch-arm.sh` as its own background task.
 Arm or re-arm the watcher only through the harness's own tracked background mechanism - the one that survives the call and notifies you when the process exits - so the cycle actually persists and the next wake reaches you.
 Never fire-and-forget the watcher with a shell `&` inside another call: that backgrounded child is reaped when the call returns, so supervision silently stops, and worse, the dying process reports a false "already running" that hides the gap.

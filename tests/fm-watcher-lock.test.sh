@@ -463,6 +463,56 @@ test_arm_reports_healthy_for_live_fresh_watcher() {
   pass "arm reports a live fresh watcher as healthy and exits zero"
 }
 
+test_arm_blocks_until_wake_with_detached_watcher() {
+  # Regression: Silentwatchtoggle. The detach fix (FM-WATCH-DETACH-1) made the
+  # arm exit ~0.3s after launching the watcher, so no process was left observing
+  # the watcher's eventual wake - the harness-tracked background task completed
+  # with no wake info and supervision went silently blind. The arm must keep the
+  # watcher OS-detached (never a child of the arm, so the captain's shell
+  # tracking cannot hang on it) while still BLOCKING until the watcher fires,
+  # then complete carrying the wake reason line.
+  local dir state fakebin armout armpid i lock_pid watcher_ppid status
+  dir=$(make_case arm-blocks-until-wake)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  # A gated check: silent until the test fires it, then an actionable wake.
+  cat > "$state/task.check.sh" <<SH
+#!/usr/bin/env bash
+[ -e "$dir/fire" ] && printf 'merged: https://example.test/pr/9\n'
+exit 0
+SH
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$armout" || fail "arm did not report a started watcher"
+  # No wake has fired yet, so the arm must still be blocking (the logical wait).
+  sleep 1
+  is_live_non_zombie "$armpid" || fail "arm returned before any wake fired - the wake notification is lost (Silentwatchtoggle)"
+  # ...but the watcher must NOT be a child of the arm: the OS-level detach stays
+  # (only the logical wait was restored), so the '1 shell still running' hang
+  # cannot come back.
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$lock_pid" ] || fail "no watcher pid recorded in the lock"
+  watcher_ppid=$(ps -o ppid= -p "$lock_pid" 2>/dev/null | tr -d '[:space:]')
+  [ -n "$watcher_ppid" ] || fail "could not read the watcher's ppid"
+  [ "$watcher_ppid" != "$armpid" ] || fail "watcher is a child of the arm (ppid=$watcher_ppid) - the '1 shell still running' hang is back"
+  # Fire the wake: the arm must now complete, carrying the wake reason.
+  touch "$dir/fire"
+  wait_for_exit "$armpid" 200
+  status=$?
+  [ "$status" -eq 0 ] || fail "arm did not complete cleanly on the wake (status $status): $(cat "$armout")"
+  grep -F "check: $state/task.check.sh: merged: https://example.test/pr/9" "$armout" >/dev/null || fail "arm completed without the wake reason line"
+  ! is_live_non_zombie "$lock_pid" || fail "watcher still running after its wake exit"
+  ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 || fail "arm left temp output behind after the wake"
+  pass "arm blocks on a detached watcher until an actionable wake and completes carrying it"
+}
+
 test_arm_starts_and_self_heals() {
   # Arming with no confirmable watcher must FORK one and confirm it live + fresh
   # before reporting 'started' - whether the lock is empty (clean start) or held
@@ -634,6 +684,7 @@ test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid
 test_watcher_self_evicts_on_lock_takeover
 test_arm_reports_healthy_for_live_fresh_watcher
+test_arm_blocks_until_wake_with_detached_watcher
 test_arm_starts_and_self_heals
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
