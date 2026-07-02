@@ -13,8 +13,15 @@
 # "already running" off the dying process. That exact mistake silently took
 # supervision down for ~30 minutes.
 #
-# This script forks the watcher as a tracked child, then VERIFIES the outcome
-# before it settles in. It confirms a watcher process is genuinely alive AND the
+# This script forks the watcher DETACHED (its own session, reparented to init -
+# never a child of this arm or of the captain's shell, so harness shell-tracking
+# cannot hang on the watcher process; FM-WATCH-DETACH-1), verifies the outcome,
+# and then keeps a LOGICAL wait on it: it blocks polling the identity-checked
+# lock and the watcher's captured output until the watcher exits with its wake,
+# then completes carrying that reason line. The arm's completion IS the wake
+# notification for the harness, exactly as when the watcher was a wait()ed
+# child - only the OS parenthood changed (the Silentwatchtoggle fix).
+# It confirms a watcher process is genuinely alive AND the
 # liveness beacon (state/.last-watcher-beat) is fresh within FM_GUARD_GRACE (the
 # single source of truth, shared with fm-watch.sh and fm-guard.sh), and prints
 # exactly one unambiguous status line:
@@ -104,6 +111,37 @@ print_watch_output() {
   [ -s "$out" ] && cat "$out"
 }
 
+# The LOGICAL wait (Silentwatchtoggle fix). The watcher exits precisely when it
+# has an actionable wake to surface (or when it stands down to a peer / dies),
+# so blocking here until the confirmed watcher is gone and then completing with
+# whatever it printed restores the pre-detach contract - the arm's completion
+# notifies the harness of the wake - without re-parenting the watcher: only the
+# lock and files are polled, never a `wait` on a child. watch_lock_matches_pid
+# guards the poll against pid reuse, and a watcher that lost the singleton ends
+# this wait too (the surviving watcher's own arm carries its wakes).
+block_until_wake_exit() {
+  while fm_pid_alive "$child" && watch_lock_matches_pid "$child"; do
+    sleep 1
+  done
+  if watch_output_has_wake "$child_out"; then
+    print_watch_output "$child_out"
+    rm -f "$child_out" 2>/dev/null || true
+    exit 0
+  fi
+  # No wake: either our watcher stood down to a peer that now holds the
+  # singleton (report it honestly - that peer's arm observes its wakes), or it
+  # died outright (fail loudly so the caller re-arms).
+  if healthy_watcher; then
+    report_healthy
+    rm -f "$child_out" 2>/dev/null || true
+    exit 0
+  fi
+  print_watch_output "$child_out"
+  rm -f "$child_out" 2>/dev/null || true
+  echo "watcher: FAILED - watcher exited without a wake"
+  exit 1
+}
+
 mode=arm
 case "${1:-}" in
   ''|arm|--arm) mode=arm ;;
@@ -139,10 +177,14 @@ if [ "$mode" = arm ] && healthy_watcher; then
   exit 0
 fi
 
-# Start a watcher as a tracked child and confirm it before settling in. The child
-# stays our child for its whole life: we wait on it, so killing this arm (the
-# harness-tracked task) tears the watcher down too, and the watcher's eventual
-# wake exit propagates out so the harness re-notifies firstmate.
+# Start a watcher detached and confirm it before settling in. The watcher is
+# never kept as a child (that parenthood is what hung the captain's shell
+# tracking on '1 shell still running'; FM-WATCH-DETACH-1) - instead this arm
+# holds the logical wait in block_until_wake_exit, so the watcher's eventual
+# wake exit still propagates out and the harness re-notifies firstmate.
+# Killing this arm still tears the watcher down via the signal traps, keeping
+# the invariant behind the healthy-watcher short-circuit above: a live watcher
+# implies a live arm blocking on it.
 child=
 child_out=
 cleanup_child() {
@@ -160,8 +202,21 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-setsid "$WATCH" >"$child_out" 2>&1 </dev/null &
-child=$!
+# Double-fork under setsid: the watcher gets its own session and the
+# intermediate subshell exits at once, so the watcher reparents to init
+# immediately and is never a child of this (still-running) arm. $! inside the
+# subshell is the watcher's pid: setsid execs in place when it is not already a
+# process-group leader, which holds for a script-spawned subshell job, and the
+# confirm loop below cross-checks that pid against the identity-checked lock
+# before trusting it.
+child=$( (setsid "$WATCH" >"$child_out" 2>&1 </dev/null & echo $!) )
+case "$child" in
+  ''|*[!0-9]*)
+    echo "watcher: FAILED - no live watcher with a fresh beacon"
+    rm -f "$child_out" 2>/dev/null || true
+    exit 1
+    ;;
+esac
 child_done=0
 
 # Verify the outcome: poll until this child is the confirmed healthy watcher, or
@@ -171,31 +226,24 @@ deadline=$(( $(date +%s) + CONFIRM_TIMEOUT ))
 while :; do
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
-      echo "watcher: started pid=$child (beacon fresh, detached)"
-      # Do NOT wait on the watcher: it is a perpetual daemon, so a wait here blocked
-      # fm-watch-arm forever, which left the captain's Claude Code background task
-      # tracked as "1 shell still running" and the terminal never reached a clean done
-      # state (FM-WATCH-DETACH-1). setsid (at launch) detaches the watcher into its own
-      # session so it survives this arm process exiting; disown drops it from job
-      # control. The singleton lockfile + fm-guard remain the source of truth for
-      # liveness/restart, so supervision is unchanged — only the captain's shell-tracking
-      # is freed.
-      disown "$child" 2>/dev/null || true
-      print_watch_output "$child_out"
-      rm -f "$child_out" 2>/dev/null || true
-      exit 0
+      echo "watcher: started pid=$child (beacon fresh)"
+      # Block until the watcher fires. The watcher is already OS-detached (own
+      # session, ppid=init) so nothing here re-creates the '1 shell still
+      # running' hang; this is the logical wait that makes the wake observable.
+      block_until_wake_exit
     fi
-    # Another watcher won the singleton; our child stood down. Report the live one.
+    # Another watcher won the singleton; our detached child stood down (it
+    # self-evicts within one poll). Report the live one.
     report_healthy
-    wait "$child" 2>/dev/null || true
     rm -f "$child_out" 2>/dev/null || true
     exit 0
   fi
   if [ "$child_done" -eq 0 ] && ! fm_pid_alive "$child"; then
-    wait "$child"
-    rc=$?
     child_done=1
-    if [ "$rc" -eq 0 ] && watch_output_has_wake "$child_out"; then
+    # The watcher is not our child, so there is no exit status to reap; its
+    # captured output is the record. A wake line means it fired immediately
+    # (before confirmation) - propagate it as the arm's completion.
+    if watch_output_has_wake "$child_out"; then
       print_watch_output "$child_out"
       rm -f "$child_out" 2>/dev/null || true
       exit 0
@@ -208,5 +256,4 @@ done
 trap - HUP TERM INT
 echo "watcher: FAILED - no live watcher with a fresh beacon"
 cleanup_child
-wait "$child" 2>/dev/null || true
 exit 1
