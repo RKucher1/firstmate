@@ -643,7 +643,7 @@ should_force_self() {  # <reason>
 is_wake_reason() {  # <reason>
   local reason=$1
   case "$reason" in
-    signal:*|stale:*|check:*|heartbeat|heartbeat:*) return 0 ;;
+    signal:*|stale:*|check:*|decision-timeout:*|heartbeat|heartbeat:*) return 0 ;;
   esac
   return 1
 }
@@ -663,6 +663,9 @@ handle_wake() {  # <reason> <state>
     stale:*)  kind=stale; arg="${reason#stale: }"
               decision=$(classify_stale "$arg" "$state") ;;
     check:*)  decision=$(classify_check "$reason") ;;
+    # A decision-timeout is always captain-relevant: a crew has sat parked at a
+    # needs-decision gate past the watcher's timeout. Escalate as-is.
+    decision-timeout:*) decision="escalate|$reason" ;;
     heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
     *)        decision=$(classify_unknown "$reason") ;;
   esac
