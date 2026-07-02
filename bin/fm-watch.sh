@@ -15,6 +15,9 @@
 #                          not provably working (surfaced at once), or a provably-
 #                          working stale past the wedge threshold, unless afk active
 #   check: <script>: <out> per-task check output, always actionable
+#   decision-timeout: <task> ...  a needs-decision gate sat unanswered past
+#                          FM_DECISION_GATE_TIMEOUT_SECS; escalate-only, the
+#                          watcher never answers the gate itself
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
 # For normal supervision, re-arm after each printed reason by running
@@ -116,6 +119,7 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a non-terminal stale escalates as a possible wedge
+DECISION_GATE_TIMEOUT=${FM_DECISION_GATE_TIMEOUT_SECS:-600}  # secs a needs-decision gate may sit unanswered before it escalates (0 disables)
 TRIAGE_LOG="$STATE/.watch-triage.log"
 TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
 
@@ -168,6 +172,58 @@ recorded_windows() {
     esac
     seen="$seen|$w|"
     printf '%s\n' "$w"
+  done
+}
+
+# Dead-crew detection (F7). A crewmate process that dies without teardown used
+# to leak forever: the .meta stayed on disk, the treehouse worktree stayed
+# leased, and the pane loop just `continue`d past the unreadable window every
+# poll. crew_window_dead returns 0 ONLY on positive evidence of death - the
+# window lists panes and EVERY pane pid is dead (a remain-on-exit husk), or the
+# window is gone while the tmux server itself answers (a killed window). An
+# unreachable tmux server is never death: it proves nothing about the crew, and
+# treating it as death would mass-reap the fleet on a server blip.
+crew_window_dead() {  # <window>
+  local w=$1 pids p
+  if pids=$(tmux list-panes -t "$w" -F '#{pane_pid}' 2>/dev/null) && [ -n "$pids" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      case "$p" in *[!0-9]*) return 1 ;; esac
+      kill -0 "$p" 2>/dev/null && return 1
+    done <<EOF
+$pids
+EOF
+    return 0
+  fi
+  tmux list-sessions >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# Reap a provably dead crew within the current cycle: return its treehouse
+# worktree (force, from the project dir - treehouse resolves the pool from the
+# working directory, same as teardown), log the anomaly to the triage log, and
+# clear the stale meta so the fleet state stops rendering a ghost. Secondmates
+# are exempt (their retirement is explicit teardown of a persistent home, never
+# a watcher-side reap). Best-effort throughout: a return failure still clears
+# the meta - a dead crew's meta must never outlive its window.
+reap_dead_crew() {  # <window>
+  local w=$1 meta id wt proj kind rc
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    [ "$(grep '^window=' "$meta" | cut -d= -f2- || true)" = "$w" ] || continue
+    kind=$(grep '^kind=' "$meta" | cut -d= -f2- || true)
+    [ "$kind" = secondmate ] && continue
+    id=$(basename "$meta"); id="${id%.meta}"
+    wt=$(grep '^worktree=' "$meta" | cut -d= -f2- || true)
+    proj=$(grep '^project=' "$meta" | cut -d= -f2- || true)
+    if [ -n "$wt" ] && [ -d "$wt" ] && [ -n "$proj" ] && [ -d "$proj" ] && command -v treehouse >/dev/null 2>&1; then
+      rc=0
+      ( cd "$proj" && treehouse return --force "$wt" ) >/dev/null 2>&1 || rc=$?
+      triage_log "reaped dead crew $id (window $w): treehouse return rc=$rc, worktree $wt, meta cleared"
+    else
+      triage_log "reaped dead crew $id (window $w): no returnable worktree, meta cleared"
+    fi
+    rm -f "$meta"
   done
 }
 
@@ -379,6 +435,13 @@ EOF
     # A secondmate idling on its own watcher is healthy. Its parent supervises
     # it through status writes and heartbeats, not pane-idle staleness.
     [ "$(window_kind "$w")" = secondmate ] && continue
+    # F7: a provably dead crew (dead pane pids, or window gone on a live tmux
+    # server) is reaped in this same cycle - worktree returned, anomaly logged,
+    # meta cleared - instead of leaking a leased worktree and a ghost meta.
+    if crew_window_dead "$w"; then
+      reap_dead_crew "$w"
+      continue
+    fi
     tail40=$(tmux capture-pane -p -t "$w" -S -40 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
@@ -465,6 +528,42 @@ EOF
       rm -f "$ssf"
     fi
   done < <(recorded_windows)
+
+  # Decision-gate timeout (F1): a crew parked at a needs-decision gate waits on
+  # the captain. The initial needs-decision signal surfaces once through the
+  # signal path above; if nobody answers, NOTHING ever fired again and the whole
+  # orchestration bricked. Timer base is the status file's mtime (when the gate
+  # line was appended); once the SAME unanswered line has sat past
+  # DECISION_GATE_TIMEOUT, enqueue a decision-timeout wake and exit - the alert
+  # path every other wake uses. Escalate-only: the watcher NEVER answers or
+  # auto-selects at the gate. One escalation per distinct decision line
+  # (.decision-escalated-* remembers the line), so an unanswered gate cannot
+  # spam a wake every poll. A gate answered out-of-band (pane injection leaves
+  # the status log stale on needs-decision) is detected via the same
+  # crew_is_provably_working read the triage paths use, and marked handled
+  # instead of alerting; under afk the daemon owns triage and that costly read
+  # never runs, so the timeout escalates directly and the daemon classifies it.
+  if [ "$DECISION_GATE_TIMEOUT" -gt 0 ] 2>/dev/null; then
+    for f in "$STATE"/*.status; do
+      [ -e "$f" ] || continue
+      last=$(last_status_line "$f")
+      case "$last" in needs-decision:*) ;; *) continue ;; esac
+      task=$(basename "$f"); task="${task%.status}"
+      dkey=$(printf '%s' "$task" | tr ':/.' '___')
+      esc="$STATE/.decision-escalated-$dkey"
+      [ "$(cat "$esc" 2>/dev/null || true)" = "$last" ] && continue
+      [ "$(age_of "$f")" -ge "$DECISION_GATE_TIMEOUT" ] || continue
+      if ! afk_present && crew_is_provably_working "$task"; then
+        printf '%s' "$last" > "$esc"
+        triage_log "decision gate resolved out-of-band (crew working again): $task"
+        continue
+      fi
+      reason="decision-timeout: $task (needs-decision unanswered ${DECISION_GATE_TIMEOUT}s+): $last"
+      fm_wake_append decision-timeout "$task" "$reason" || exit 1
+      printf '%s' "$last" > "$esc"
+      wake "$reason"
+    done
+  fi
 
   # Heartbeat: the watcher runs a cheap fleet-scan at a regular cadence no matter
   # what. Time-based via .last-heartbeat mtime; interval doubles per consecutive

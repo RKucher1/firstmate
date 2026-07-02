@@ -73,7 +73,20 @@ case "${1:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fb/no-mistakes" "$fb/tmux"
+  # Fake gh: `gh pr checks` serves FM_FAKE_GH_PR_CHECKS (tab-separated
+  # name/state/elapsed/url rows) with FM_FAKE_GH_PR_CHECKS_RC (default 1, the
+  # exit gh uses when no check passed). Anything else fails, keeping the helper
+  # hermetic.
+  cat > "$fb/gh" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
+  if [ -n "${FM_FAKE_GH_PR_CHECKS:-}" ]; then printf '%s\n' "$FM_FAKE_GH_PR_CHECKS"; fi
+  exit "${FM_FAKE_GH_PR_CHECKS_RC:-1}"
+fi
+exit 1
+SH
+  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh"
   printf '%s\n' "$fb"
 }
 
@@ -109,7 +122,10 @@ reset_fakes() {
   FM_FAKE_AXI_LIST=""
   FM_FAKE_BUSY=0
   FM_FAKE_TMUX_MISSING=0
-  export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_AXI_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
+  FM_FAKE_GH_PR_CHECKS=""
+  FM_FAKE_GH_PR_CHECKS_RC=1
+  export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_AXI_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING \
+    FM_FAKE_GH_PR_CHECKS FM_FAKE_GH_PR_CHECKS_RC
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -234,6 +250,25 @@ run:
 EOF
 }
 
+# A run sitting in the ci step: the top-level status no-mistakes emits while it
+# polls GitHub checks.
+run_ci_step() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: ci
+  head: "abc1234"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+  steps[4]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    review,completed,0,0
+    push,completed,0,0
+    ci,running,0,0
+EOF
+}
+
 # ---------------------------------------------------------------------------
 # (a) active run-step is authoritative
 test_active_run_is_authoritative() {
@@ -347,6 +382,71 @@ test_ci_ready_done_log_beats_monitoring_run() {
   assert_contains "$out" "checks green" "ci-ready detail preserves the report"
   assert_not_contains "$out" "state: working" "ci-ready is not hidden by monitoring run"
   pass "ci-ready status log beats monitoring run"
+}
+
+# F8: an all-SKIPPED GitHub check set must conclude the ci step. Conditional
+# workflows can skip EVERY check for a branch; `gh pr checks` then exits 1 with
+# only skipped rows, the ci poller waits forever, and the crew renders "ci
+# running" until the run times out - even though the PR rollup is clean. The
+# helper now treats that exact shape (>=1 check, all skipped/neutral, none
+# failed/pending/passing) as inconclusive-as-passed -> done. A genuinely failing
+# or still-pending check, a gh error, or empty output must NOT be masked.
+test_ci_all_skipped_reports_done() {
+  reset_fakes
+  local d; d=$(new_case ci-all-skipped)
+  make_repo_on_branch "$d/wt" fm/feat-f8a
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f8a.meta" "window=fm:fm-feat-f8a" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_ci_step fm/feat-f8a)"
+  FM_FAKE_GH_PR_CHECKS="$(printf 'adversarial-review\tskipping\t0\thttps://x\narch-fit-review\tskipping\t0\thttps://x\nwrite-vault\tskipping\t0\thttps://x')"
+  FM_FAKE_GH_PR_CHECKS_RC=1
+  local out; out=$(run_crew_state "$d" feat-f8a)
+  assert_contains "$out" "state: done" "all-skipped check set -> done"
+  assert_contains "$out" "source: run-step" "all-skipped verdict stays run-step sourced"
+  assert_contains "$out" "skipped" "all-skipped detail names the skip shape"
+  pass "an all-skipped check set concludes the ci step as done (inconclusive-as-passed)"
+}
+
+test_ci_failing_check_never_masked() {
+  reset_fakes
+  local d; d=$(new_case ci-fail-not-masked)
+  make_repo_on_branch "$d/wt" fm/feat-f8b
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f8b.meta" "window=fm:fm-feat-f8b" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_ci_step fm/feat-f8b)"
+  FM_FAKE_GH_PR_CHECKS="$(printf 'unit\tfail\t10s\thttps://x\nlint\tskipping\t0\thttps://x')"
+  local out; out=$(run_crew_state "$d" feat-f8b)
+  assert_contains "$out" "state: working" "a failing check keeps ci running for the pipeline to report"
+  assert_contains "$out" "ci running" "failing-check detail unchanged"
+  pass "a genuinely failing check is never masked by the all-skipped shortcut"
+}
+
+test_ci_pending_check_never_masked() {
+  reset_fakes
+  local d; d=$(new_case ci-pending-not-masked)
+  make_repo_on_branch "$d/wt" fm/feat-f8c
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f8c.meta" "window=fm:fm-feat-f8c" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_ci_step fm/feat-f8c)"
+  FM_FAKE_GH_PR_CHECKS="$(printf 'unit\tpending\t0\thttps://x\nlint\tskipping\t0\thttps://x')"
+  FM_FAKE_GH_PR_CHECKS_RC=8
+  local out; out=$(run_crew_state "$d" feat-f8c)
+  assert_contains "$out" "state: working" "a pending check keeps ci running"
+  pass "a still-pending check is never masked by the all-skipped shortcut"
+}
+
+test_ci_gh_error_keeps_running() {
+  reset_fakes
+  local d; d=$(new_case ci-gh-error)
+  make_repo_on_branch "$d/wt" fm/feat-f8d
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f8d.meta" "window=fm:fm-feat-f8d" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_ci_step fm/feat-f8d)"
+  FM_FAKE_GH_PR_CHECKS=""
+  local out; out=$(run_crew_state "$d" feat-f8d)
+  assert_contains "$out" "state: working" "a gh error/empty output changes nothing"
+  assert_contains "$out" "ci running" "gh-error detail unchanged"
+  pass "a gh error or empty check list leaves the ci step reported as running"
 }
 
 # (d) terminal run-step is authoritative
@@ -614,6 +714,10 @@ test_genuine_parked_not_superseded
 test_scalar_gate_parked_not_superseded
 test_gate_block_parked_not_superseded
 test_ci_ready_done_log_beats_monitoring_run
+test_ci_all_skipped_reports_done
+test_ci_failing_check_never_masked
+test_ci_pending_check_never_masked
+test_ci_gh_error_keeps_running
 test_terminal_passed
 test_terminal_failed
 test_cross_branch_attribution_via_list

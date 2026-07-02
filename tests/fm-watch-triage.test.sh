@@ -555,6 +555,94 @@ test_beacon_stays_fresh_while_absorbing() {
   pass "the liveness beacon stays fresh while the watcher absorbs benign wakes (fm-guard never false-alarms)"
 }
 
+# --- decision-gate timeout: a parked needs-decision escalates, never bricks ---
+# A crew parked at a decision gate waits on the captain. The initial
+# needs-decision signal surfaces once; if nobody answers, nothing ever fired
+# again and the whole orchestration bricked (finding F1). The watcher now runs a
+# timer off the status file's mtime: once the SAME needs-decision line has sat
+# unanswered past FM_DECISION_GATE_TIMEOUT_SECS, it enqueues a decision-timeout
+# wake and exits - escalate-only, never auto-answering the gate.
+
+# Prime the signal-scan and heartbeat suppressors for a status file so only the
+# decision-gate timer can fire for it.
+prime_status_suppressors() {  # <state> <task>
+  local state=$1 task=$2 sig last
+  sig=$(seen_sig "$state/$task.status"); printf '%s' "$sig" > "$state/.seen-${task}_status"
+  last=$(grep -v '^[[:space:]]*$' "$state/$task.status" | tail -1)
+  printf '%s' "$last" > "$state/.hb-surfaced-$task"
+}
+
+test_decision_gate_timeout_escalates_once() {
+  local dir state fakebin out drain_out status_file pid
+  dir=$(make_case decision-timeout); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  status_file="$state/task.status"
+  printf 'working: setup\nneeds-decision: pick A or B\n' > "$status_file"
+  # The gate has been parked well past the timeout (mtime is the timer base).
+  touch -d '2 hours ago' "$status_file" 2>/dev/null || touch -t 202001010000 "$status_file"
+  prime_status_suppressors "$state" task
+  # No running pipeline: the crew is genuinely parked on the gate.
+  export FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at gate'
+  watch_bg "$state" "$fakebin" "$out" env FM_DECISION_GATE_TIMEOUT_SECS=60
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not escalate a decision gate parked past the timeout"
+  grep -E "^decision-timeout: task " "$out" >/dev/null || fail "watcher did not print the decision-timeout wake: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the decision timeout failed"
+  grep "$(printf '\tdecision-timeout\t')" "$drain_out" | grep -F "task" >/dev/null || fail "decision timeout was not queued"
+  [ -s "$state/.decision-escalated-task" ] || fail "decision escalation marker was not recorded"
+
+  # Escalate ONCE per distinct decision line: a relaunched watcher must not
+  # re-fire the same unanswered gate every cycle.
+  : > "$out"
+  watch_bg "$state" "$fakebin" "$out" env FM_DECISION_GATE_TIMEOUT_SECS=60
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher re-escalated an already-escalated decision gate: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "already-escalated decision gate enqueued a second wake"; }
+  reap "$pid"
+  pass "a needs-decision gate parked past the timeout escalates as decision-timeout, exactly once per decision line"
+}
+
+test_decision_gate_within_timeout_waits() {
+  local dir state fakebin out status_file pid
+  dir=$(make_case decision-fresh); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  status_file="$state/task.status"
+  printf 'needs-decision: pick A or B\n' > "$status_file"
+  prime_status_suppressors "$state" task
+  export FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at gate'
+  watch_bg "$state" "$fakebin" "$out" env FM_DECISION_GATE_TIMEOUT_SECS=600
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher escalated a decision gate still inside the timeout: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "in-window decision gate enqueued a wake"; }
+  [ ! -e "$state/.decision-escalated-task" ] || { reap "$pid"; fail "in-window decision gate recorded an escalation marker"; }
+  reap "$pid"
+  pass "a needs-decision gate inside the timeout window is left to the captain (no premature escalation)"
+}
+
+test_decision_gate_resumed_crew_suppressed() {
+  local dir state fakebin out status_file pid
+  dir=$(make_case decision-resumed); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  status_file="$state/task.status"
+  printf 'needs-decision: pick A or B\n' > "$status_file"
+  touch -d '2 hours ago' "$status_file" 2>/dev/null || touch -t 202001010000 "$status_file"
+  prime_status_suppressors "$state" task
+  # The gate was answered out-of-band (pane injection): the run resumed, only the
+  # status log is stale. No alert - mark the line handled instead.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  watch_bg "$state" "$fakebin" "$out" env FM_DECISION_GATE_TIMEOUT_SECS=60
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher escalated a decision gate whose crew already resumed: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "resumed-crew decision gate enqueued a wake"; }
+  [ -s "$state/.decision-escalated-task" ] || { reap "$pid"; fail "resumed-crew decision line was not marked handled"; }
+  reap "$pid"
+  pass "a stale needs-decision line whose crew provably resumed is marked handled, not escalated"
+}
+
 # --- afk coherence: the daemon owns triage; the watcher does not double-triage ---
 
 test_afk_present_reverts_watcher_to_one_shot() {
@@ -597,4 +685,7 @@ test_triage_log_size_cap_accepts_spaced_wc_counts
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
+test_decision_gate_timeout_escalates_once
+test_decision_gate_within_timeout_waits
+test_decision_gate_resumed_crew_suppressed
 test_afk_present_reverts_watcher_to_one_shot

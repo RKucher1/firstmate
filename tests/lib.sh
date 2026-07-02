@@ -30,6 +30,15 @@ FM_TEST_LIB_SOURCED=1
 # shellcheck disable=SC2034
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# fm-guard.sh self-heals a stale watcher by spawning a DETACHED real
+# bin/fm-watch-arm.sh (F2), and the guard runs at the top of many bin/ scripts
+# these suites exercise (fm-send, fm-teardown, fm-wake-drain, ...). Test cases
+# routinely present exactly the trigger shape - in-flight metas with a stale or
+# absent beacon - so leaving the self-heal on would leak a real watcher process
+# per case. Default it off for every test; the guard-self-heal tests re-enable
+# it explicitly against a recording FM_WATCH_ARM_BIN fake.
+export FM_GUARD_SELF_HEAL=${FM_GUARD_SELF_HEAL:-0}
+
 # --- reporters --------------------------------------------------------------
 
 fail() {
