@@ -579,8 +579,13 @@ if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   # Kills remaining processes in the worktree (including the agent), resets, returns
   # to pool. treehouse resolves the pool from the working directory, so run it from
-  # the project.
-  ( cd "$PROJ" && treehouse return --force "$WT" )
+  # the project. Guarded against set -eu (finding F11): a return failure (lingering
+  # run processes, a release race) used to abort teardown BEFORE kill-window and
+  # meta-clear, stranding a husk window and a ghost meta - warn and continue, the
+  # same pattern as the fleet-sync call below.
+  if ! ( cd "$PROJ" && treehouse return --force "$WT" ); then
+    echo "warning: treehouse return --force failed for $WT (rerun it manually); continuing teardown so the window and meta are still cleared" >&2
+  fi
 fi
 
 tmux kill-window -t "$T" 2>/dev/null || true
