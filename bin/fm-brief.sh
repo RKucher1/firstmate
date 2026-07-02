@@ -211,6 +211,10 @@ You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow no-mistakes' own guidance for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
 
+Shepherd your run to a terminal state: start it in the FOREGROUND and stay on watch until it passes, fails, or parks at a gate.
+Never fire the pipeline as a background command and end your turn - a run that gates (awaiting_approval, an ask-user finding) while you are asleep strands until it times out, and the escalation never reaches firstmate.
+If your harness backgrounds long commands anyway, poll \`no-mistakes axi status\` and do not end your turn until the run is terminal or you have escalated its gate (rules 5/6).
+
 Two firstmate-specific rules layer on top of that guidance:
 - ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
