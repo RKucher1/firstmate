@@ -20,14 +20,6 @@ if [ -z "${FM_ROOT_OVERRIDE:-}" ]; then
   export FM_ROOT_OVERRIDE
 fi
 
-# fm-guard.sh now self-heals a stale watcher by spawning a detached
-# bin/fm-watch-arm.sh (F2). Across these suites many cases intentionally run the
-# guard with in-flight metas and a stale/absent beacon; letting each spawn a REAL
-# watcher against a throwaway state dir would leak processes on every run. Default
-# the self-heal off suite-wide; the guard-self-heal tests re-enable it explicitly
-# against a recording fake (FM_WATCH_ARM_BIN).
-export FM_GUARD_SELF_HEAL=${FM_GUARD_SELF_HEAL:-0}
-
 # append_wake <state> <kind> <key> <payload>: append a wake record to the durable
 # queue in a subshell scoped to <state>, using the production wake library.
 append_wake() {
