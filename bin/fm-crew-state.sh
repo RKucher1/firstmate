@@ -154,6 +154,44 @@ nm_run() {  # <args...>
   esac
 }
 
+# Bounded gh call in the worktree, same shape as nm_run; stdout only, never
+# fails the script. Used only on the ci path below.
+gh_run() {  # <args...>
+  case "$HAVE_TIMEOUT" in
+    timeout)  ( cd "$WT" && timeout "$NM_TIMEOUT" gh "$@" ) 2>/dev/null || true ;;
+    gtimeout) ( cd "$WT" && gtimeout "$NM_TIMEOUT" gh "$@" ) 2>/dev/null || true ;;
+    perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$NM_TIMEOUT" gh "$@" ) 2>/dev/null || true ;;
+    *)        true ;;
+  esac
+}
+
+# F8: an all-SKIPPED GitHub check set never concludes. Conditional workflows can
+# skip EVERY check for a branch (observed: every dashboard action skips fm/*
+# branches); `gh pr checks` then exits 1 with only skipped rows, no-mistakes' ci
+# poller waits forever, and this helper reported "ci running" until the run
+# timed out - while the PR rollup was clean and mergeable. Detect that exact
+# shape from the worktree's own PR: at least one check listed and EVERY row's
+# state skipped/skipping/neutral. Any failing, pending, or passing row - or a gh
+# error / empty listing - returns non-zero, so a real verdict is never masked;
+# only the all-skipped stall flips to done (inconclusive-as-passed).
+ci_checks_all_skipped() {
+  local out line state n=0
+  command -v gh >/dev/null 2>&1 || return 1
+  out=$(gh_run pr checks)
+  [ -n "$out" ] || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    state=$(printf '%s\n' "$line" | awk -F'\t' '{print tolower($2)}')
+    case "$state" in
+      skipping|skipped|neutral) n=$((n + 1)) ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$out
+EOF
+  [ "$n" -ge 1 ]
+}
+
 # Scalar value of a TOON key in the captured run output ($RUN_OUT).
 RUN_OUT=""
 nm_field() {  # <key>
@@ -313,7 +351,11 @@ if [ "$HAVE_RUN" = 1 ]; then
     fi
   else
     case "$status" in
-      ci)             RUN_STATE=working; RUN_DETAIL="ci running" ;;
+      ci)             if ci_checks_all_skipped; then
+                        RUN_STATE="done"; RUN_DETAIL="ci inconclusive: all checks skipped, none failed - PR ready for review"
+                      else
+                        RUN_STATE=working; RUN_DETAIL="ci running"
+                      fi ;;
       running|fixing) RUN_STATE=working; RUN_DETAIL="validating ($status)" ;;
       completed)      RUN_STATE="done"; RUN_DETAIL="run completed" ;;
       failed)         RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
