@@ -11,6 +11,14 @@
 # doing - the one channel every harness has. Normal wake handling (watcher
 # briefly down between a wake and its re-arm) stays inside the grace window and
 # stays silent. Always exits 0: the guard warns, it never blocks.
+#
+# Self-heal (F2): a stale beacon with tasks in flight also spawns ONE detached
+# bin/fm-watch-arm.sh per grace window (cooldown via state/.guard-rearm-attempt),
+# so supervision recovers even when nobody acts on the banner. The arm is
+# idempotent (healthy-watcher short-circuit) and its output lands in
+# state/.guard-rearm.log; any wake it observes is already durable in the queue.
+# FM_GUARD_SELF_HEAL=0 disables the spawn (banner-only, the old behavior);
+# FM_WATCH_ARM_BIN overrides the arm path (tests point it at a recording fake).
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,6 +92,23 @@ fi
 # No fresh watcher with tasks in flight is the dangerous state: emit a prominent,
 # bordered banner FIRST so it reads as an alarm, not a buried stderr line.
 if [ "$watcher_fresh" = false ]; then
+  # Self-heal: attempt one detached re-arm per grace window. Best-effort and
+  # cooldown-bounded (.guard-rearm-attempt mtime) so back-to-back guard calls
+  # cannot storm arms; the banner below still alarms either way. setsid detaches
+  # the arm from this guard (and from whatever supervision script called it), so
+  # harness shell-tracking never hangs on the arm's long logical wait.
+  self_heal_note=""
+  if [ "${FM_GUARD_SELF_HEAL:-1}" != 0 ]; then
+    WATCH_ARM_BIN="${FM_WATCH_ARM_BIN:-$SCRIPT_DIR/fm-watch-arm.sh}"
+    rearm_marker="$STATE/.guard-rearm-attempt"
+    if [ ! -e "$rearm_marker" ] || [ "$(fm_path_age "$rearm_marker")" -ge "$GRACE" ]; then
+      touch "$rearm_marker" 2>/dev/null || true
+      ( setsid "$WATCH_ARM_BIN" >> "$STATE/.guard-rearm.log" 2>&1 </dev/null & ) 2>/dev/null || true
+      self_heal_note="self-heal: re-arm spawned detached (output: state/.guard-rearm.log). Verify with bin/fm-watch-arm.sh."
+    else
+      self_heal_note="self-heal: re-arm already attempted $(fm_path_age "$rearm_marker")s ago; not repeating inside grace."
+    fi
+  fi
   if "$queue_pending"; then
     fix='After draining queued wakes, re-arm the watcher: run bin/fm-watch-arm.sh as the harness-tracked background task (never a shell & that gets reaped).'
   else
@@ -96,6 +121,7 @@ if [ "$watcher_fresh" = false ]; then
     printf '●  %s task(s) in flight, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
     printf '●  Trust bin/fm-watch-arm.sh for the true state: it confirms a live watcher and a fresh beacon, or fails loudly.\n'
     printf '●  %s\n' "$fix"
+    [ -n "$self_heal_note" ] && printf '●  %s\n' "$self_heal_note"
     printf '●%s\n' "$rule"
   } >&2
 fi

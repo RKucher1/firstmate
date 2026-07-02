@@ -142,6 +142,89 @@ test_guard_warnings() {
   pass "guard banner leads when down with pending wakes (re-arm-after-drain) and stays silent when fresh"
 }
 
+# --- guard self-heal (F2): a stale beacon re-arms once, never dies silently ---
+# When supervision lapses (beacon stale, tasks in flight) the guard used to only
+# print the banner and hope the agent acted. It now ALSO attempts one detached
+# re-arm per grace window (cooldown-bounded, idempotent through fm-watch-arm's
+# healthy short-circuit), so a lapse self-heals even when the banner is skimmed.
+# FM_WATCH_ARM_BIN points the spawn at a recording fake so no real watcher runs.
+
+# Install a fake fm-watch-arm that records each invocation; echoes its path.
+make_fake_watch_arm() {  # <dir>
+  local dir=$1
+  cat > "$dir/fake-watch-arm.sh" <<SH
+#!/usr/bin/env bash
+printf 'armed\n' >> "$dir/arm-calls"
+exit 0
+SH
+  chmod +x "$dir/fake-watch-arm.sh"
+  printf '%s\n' "$dir/fake-watch-arm.sh"
+}
+
+wait_for_file_lines() {  # <file> <min-lines> [limit]
+  local file=$1 want=$2 limit=${3:-30} i=0 n
+  while [ "$i" -lt "$limit" ]; do
+    n=$(grep -c . "$file" 2>/dev/null || echo 0)
+    [ "$n" -ge "$want" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+test_guard_self_heals_stale_watcher_once_per_grace() {
+  local dir state err arm
+  dir=$(make_case guard-self-heal)
+  state="$dir/state"
+  err="$dir/guard.err"
+  arm=$(make_fake_watch_arm "$dir")
+  printf 'project=x\n' > "$state/task.meta"
+  # No beacon at all: supervision is down with a task in flight.
+  FM_GUARD_SELF_HEAL=1 FM_WATCH_ARM_BIN="$arm" FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
+  grep -F 'WATCHER DOWN - SUPERVISION IS OFF' "$err" >/dev/null || fail "self-heal dropped the alarm banner"
+  grep -F 'self-heal' "$err" >/dev/null || fail "guard banner does not mention the self-heal attempt"
+  wait_for_file_lines "$dir/arm-calls" 1 30 || fail "guard did not spawn a re-arm for a stale watcher"
+  [ -e "$state/.guard-rearm-attempt" ] || fail "guard did not record the re-arm attempt marker"
+
+  # A second guard call inside the grace window must NOT spawn another arm
+  # (cooldown), but the banner must still alarm.
+  : > "$err"
+  FM_GUARD_SELF_HEAL=1 FM_WATCH_ARM_BIN="$arm" FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "second guard call failed"
+  grep -F 'WATCHER DOWN - SUPERVISION IS OFF' "$err" >/dev/null || fail "cooldown run dropped the alarm banner"
+  sleep 0.5
+  [ "$(grep -c . "$dir/arm-calls")" -eq 1 ] || fail "guard re-armed again inside the cooldown window"
+
+  # Past the cooldown (backdated marker) it re-arms again.
+  touch -d '1 hour ago' "$state/.guard-rearm-attempt" 2>/dev/null || touch -t 202001010000 "$state/.guard-rearm-attempt"
+  FM_GUARD_SELF_HEAL=1 FM_WATCH_ARM_BIN="$arm" FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2>/dev/null >/dev/null || fail "third guard call failed"
+  wait_for_file_lines "$dir/arm-calls" 2 30 || fail "guard did not re-arm again after the cooldown expired"
+  pass "guard self-heals a stale watcher: one detached re-arm per grace window, banner intact"
+}
+
+test_guard_self_heal_stays_inert_when_fresh_or_disabled() {
+  local dir state arm
+  dir=$(make_case guard-self-heal-inert)
+  state="$dir/state"
+  arm=$(make_fake_watch_arm "$dir")
+  printf 'project=x\n' > "$state/task.meta"
+  # Fresh beacon: nothing to heal.
+  touch "$state/.last-watcher-beat"
+  FM_GUARD_SELF_HEAL=1 FM_WATCH_ARM_BIN="$arm" FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2>/dev/null >/dev/null || fail "guard failed on fresh beacon"
+  sleep 0.5
+  [ ! -e "$dir/arm-calls" ] || fail "guard spawned a re-arm despite a fresh beacon"
+  # Stale beacon but self-heal disabled: banner-only, no spawn.
+  rm -f "$state/.last-watcher-beat"
+  FM_GUARD_SELF_HEAL=0 FM_WATCH_ARM_BIN="$arm" FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2>/dev/null >/dev/null || fail "guard failed with self-heal disabled"
+  sleep 0.5
+  [ ! -e "$dir/arm-calls" ] || fail "guard spawned a re-arm with FM_GUARD_SELF_HEAL=0"
+  pass "guard self-heal stays inert on a fresh beacon and under FM_GUARD_SELF_HEAL=0"
+}
+
 test_lock_single_winner_under_concurrency() {
   local dir state lockdir marker i pids pid wins
   dir=$(make_case lock-concurrency)
@@ -673,6 +756,8 @@ test_singleton_start
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
+test_guard_self_heals_stale_watcher_once_per_grace
+test_guard_self_heal_stays_inert_when_fresh_or_disabled
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency

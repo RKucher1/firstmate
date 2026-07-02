@@ -10,6 +10,13 @@
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# fm-guard.sh self-heals a stale watcher by spawning a detached
+# bin/fm-watch-arm.sh (F2). Secondmate phases run guard-bearing scripts
+# (fm-teardown, fm-spawn recovery) against throwaway homes with in-flight metas
+# and no beacon; letting each spawn a REAL watcher would leak processes on every
+# run. Default the self-heal off suite-wide (same shield as wake-helpers.sh).
+export FM_GUARD_SELF_HEAL=${FM_GUARD_SELF_HEAL:-0}
+
 # A fake tmux (window ops are logged to FM_FAKE_TMUX_LOG, list-windows returns
 # FM_FAKE_TMUX_WINDOW, capture-pane echoes FM_FAKE_TMUX_CAPTURE) plus a fake
 # treehouse (durable lease of FM_FAKE_TREEHOUSE_HOME, recording the lease holder
