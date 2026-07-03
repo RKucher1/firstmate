@@ -577,6 +577,15 @@ if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
+  # Reap a watcher that ran as THIS worktree's own firstmate home. A self-dev home
+  # arms bin/fm-watch.sh setsid/disown (ppid=1, FM-WATCH-DETACH-1), so the treehouse
+  # return below - which only kills processes still parented into the worktree -
+  # leaves it running forever (two 3-day-old orphans observed in COCKPIT-FM-CLEANUP-1).
+  # Scoped by the ABSOLUTE worktree path so it matches only this home's watcher, never
+  # a sibling's or the captain's - that is exactly why the bare `pkill -f
+  # bin/fm-watch.sh` is banned but this full-path form is safe. || true: pkill exits
+  # non-zero on no match, and set -e is active.
+  pkill -f "$WT/bin/fm-watch.sh" 2>/dev/null || true
   # Kills remaining processes in the worktree (including the agent), resets, returns
   # to pool. treehouse resolves the pool from the working directory, so run it from
   # the project. Guarded against set -eu (finding F11): a return failure (lingering
