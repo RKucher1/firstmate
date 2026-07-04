@@ -2,7 +2,7 @@
 
 # Run the firstmate bash behavior suite deterministically as the test-step
 # baseline, instead of delegating to an agent (an agent-driven test step has
-# crashed the daemon). Mirrors .github/workflows/ci.yml: iterate every
+# crashed the daemon). This local pipeline is the gate: iterate every
 # tests/*.test.sh, run each, and fail the step if any one exits non-zero. The
 # e2e tests need tmux on PATH, which the firstmate environment provides.
 commands:

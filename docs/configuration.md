@@ -16,7 +16,7 @@ Compatible means the shared bootstrap probe accepts `tasks-axi --version` as 0.1
 
 The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and defines `commands.test` so no-mistakes runs firstmate's bash behavior suite directly.
 That command requires `tmux` on `PATH`, prints `tmux -V`, runs every `tests/*.test.sh` with `bash`, and fails if any script exits non-zero.
-It intentionally mirrors the behavior-test baseline in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) instead of delegating the test step to an agent.
+It runs the behavior-test baseline directly instead of delegating the test step to an agent; this local pipeline is the gate.
 
 ## Captain preferences (data/captain.md)
 
