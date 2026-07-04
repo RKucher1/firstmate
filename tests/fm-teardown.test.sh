@@ -175,6 +175,11 @@ land_on_origin_main() {
 }
 
 # Override GitHub lookups to report PR 7 as merged with the supplied head.
+#
+# The gh mock answers both structured queries in the landed-work ecosystem: teardown's
+# version-tolerant `state,commits` query (state + branch head oid) and fm-pr-check's
+# `headRefOid` query (branch head oid). See test_squash_merged_old_gh_allows for the
+# stricter mock that emulates this box's older gh, where headRefOid is unknown.
 add_gh_pr_merged_for_head() {
   local case_dir=$1 head=$2
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
@@ -192,7 +197,7 @@ SH
 case "\${1:-} \${2:-}" in
   "pr view")
     case " \$* " in
-      *"state,headRefOid"*) printf '%s\t%s\n' 'MERGED' '$head' ; exit 0 ;;
+      *"state,commits"*) printf '%s\t%s\n' 'MERGED' '$head' ; exit 0 ;;
       *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
     esac
     ;;
@@ -201,6 +206,55 @@ echo "error: pull request not found" >&2
 exit 1
 SH
   chmod +x "$case_dir/fakebin/gh-axi" "$case_dir/fakebin/gh"
+}
+
+# Like add_gh_pr_merged_for_head, but emulates this box's OLDER gh, whose `pr view`
+# does not know the `headRefOid` JSON field and errors on it (the real failure that
+# false-refused merged-PR teardowns). Only the version-tolerant `state,commits` query
+# succeeds. Used by the regression test that proves teardown no longer depends on
+# headRefOid. Args: case_dir head
+add_gh_old_no_headrefoid_merged_for_head() {
+  local case_dir=$1 head=$2
+  cat > "$case_dir/fakebin/gh" <<SH
+#!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "pr view")
+    case " \$* " in
+      *"headRefOid"*)
+        printf '%s\n' 'Unknown JSON field: "headRefOid"' >&2 ; exit 1 ;;
+      *"state,commits"*) printf '%s\t%s\n' 'MERGED' '$head' ; exit 0 ;;
+    esac
+    ;;
+esac
+echo "error: pull request not found" >&2
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/gh"
+}
+
+# Shim `git` in the case fakebin as a pre-2.38 git: it forwards every call to the
+# real git EXCEPT `merge-tree --write-tree`, which it rejects like old git does
+# (`unknown rev --write-tree`), forcing teardown down its read-tree fallback path.
+# This makes the old-git behavior deterministically testable on any box. The real
+# git path is captured at call time, before the fakebin is on PATH. Args: case_dir
+add_old_git_without_merge_tree_write() {
+  local case_dir=$1 real_git
+  real_git=$(command -v git)
+  cat > "$case_dir/fakebin/git" <<SH
+#!/usr/bin/env bash
+# Emulate Git < 2.38: no 'merge-tree --write-tree'.
+seen_mt= ; seen_wt=
+for a in "\$@"; do
+  [ "\$a" = merge-tree ] && seen_mt=1
+  [ "\$a" = --write-tree ] && seen_wt=1
+done
+if [ -n "\$seen_mt" ] && [ -n "\$seen_wt" ]; then
+  echo "fatal: unknown rev --write-tree" >&2
+  exit 128
+fi
+exec "$real_git" "\$@"
+SH
+  chmod +x "$case_dir/fakebin/git"
 }
 
 append_pr_meta_for_current_head() {
@@ -559,6 +613,138 @@ SH
   pass "a failed treehouse return warns and still completes window-kill + meta-clear"
 }
 
+# Version-tolerance regression: the squash-merge-then-delete-branch case must tear
+# down WITHOUT --force even on this box's OLDER gh, whose `pr view` has no
+# headRefOid field. Before the fix, pr_is_merged asked for headRefOid, gh errored,
+# the merged-PR signal was lost, and teardown false-refused genuinely landed work.
+# The head commit is now derived from `state,commits`, so the merged PR is
+# recognized and teardown succeeds.
+test_squash_merged_old_gh_allows() {
+  local case_dir rc pr_head
+  case_dir=$(make_case squash-old-gh)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  append_pr_meta_for_current_head "$case_dir"
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  add_gh_old_no_headrefoid_merged_for_head "$case_dir" "$pr_head"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "squash-old-gh: teardown should succeed with a merged PR on old gh"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "squash-old-gh: teardown printed a REFUSED line"
+  pass "squash-merged PR is recognized without headRefOid on older gh (the gh fix)"
+}
+
+# Version-tolerance regression: an old gh that lacks headRefOid must NOT let unlanded
+# work tear down. Here the PR reports OPEN (not merged) via state,commits, and the
+# content never landed on origin/main, so both landed-work signals are false and
+# teardown must still refuse.
+test_old_gh_open_pr_unlanded_refuses() {
+  local case_dir rc pr_head
+  case_dir=$(make_case open-old-gh)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  append_pr_meta_for_current_head "$case_dir"
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  # Old gh mock, but the PR is OPEN, not merged.
+  cat > "$case_dir/fakebin/gh" <<SH
+#!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "pr view")
+    case " \$* " in
+      *"headRefOid"*) printf '%s\n' 'Unknown JSON field: "headRefOid"' >&2 ; exit 1 ;;
+      *"state,commits"*) printf '%s\t%s\n' 'OPEN' '$pr_head' ; exit 0 ;;
+    esac
+    ;;
+esac
+echo "error: pull request not found" >&2
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/gh"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "open-old-gh: teardown should refuse an unmerged PR with unlanded content"
+  grep -q REFUSED "$case_dir/stderr" || fail "open-old-gh: no REFUSED line in stderr"
+  pass "old gh + open PR + content not in default still refuses (safety preserved)"
+}
+
+# Version-tolerance regression: the content-in-default fallback must ALLOW teardown
+# on a pre-2.38 git that lacks `merge-tree --write-tree`. No PR is recorded, so the
+# read-tree fallback alone must recognize that the branch's net change already landed
+# on origin/main via a squash commit. Before the fix, merge-tree --write-tree errored
+# on old git and this genuinely landed work was false-refused.
+test_content_fallback_old_git_allows() {
+  local case_dir rc
+  case_dir=$(make_case content-old-git)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_on_origin_main "$case_dir" feature.txt hello
+  add_old_git_without_merge_tree_write "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "content-old-git: teardown should succeed via the read-tree fallback"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "content-old-git: teardown printed a REFUSED line"
+  pass "content-in-default fallback recognizes landed work without merge-tree --write-tree (the git fix)"
+}
+
+# Version-tolerance regression: the read-tree fallback must NOT false-pass. With no PR
+# and genuinely unlanded content, teardown must refuse even on a pre-2.38 git.
+test_content_fallback_old_git_unlanded_refuses() {
+  local case_dir rc
+  case_dir=$(make_case content-old-git-unlanded)
+  write_meta "$case_dir" no-mistakes ship
+  # Real content, not pushed, no PR (default mock), never landed on origin/main.
+  wt_commit_file "$case_dir" feature.txt hello "unpushed work"
+  add_old_git_without_merge_tree_write "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "content-old-git-unlanded: teardown should refuse genuinely unlanded work"
+  grep -q REFUSED "$case_dir/stderr" || fail "content-old-git-unlanded: no REFUSED line in stderr"
+  pass "read-tree fallback refuses genuinely unlanded work on old git (no false pass)"
+}
+
+# Version-tolerance regression: dirtiness must win even on old tooling. The committed
+# work has fully landed (merged PR on old gh + content in origin/main), but an
+# uncommitted edit remains; teardown must still refuse because the reset would discard
+# it. Exercises both the old-gh and old-git paths together.
+test_dirty_worktree_old_tooling_refuses() {
+  local case_dir rc pr_head
+  case_dir=$(make_case dirty-old-tooling)
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_on_origin_main "$case_dir" feature.txt hello
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  add_gh_old_no_headrefoid_merged_for_head "$case_dir" "$pr_head"
+  add_old_git_without_merge_tree_write "$case_dir"
+  printf '%s\n' "uncommitted edit" > "$case_dir/wt/feature.txt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "dirty-old-tooling: teardown should refuse a dirty worktree even when landed on old tooling"
+  grep -q REFUSED "$case_dir/stderr" || fail "dirty-old-tooling: no REFUSED line in stderr"
+  grep -q "uncommitted changes" "$case_dir/stderr" || fail "dirty-old-tooling: refusal did not cite uncommitted changes"
+  pass "dirty worktree is refused on old gh + old git even when its committed work landed"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_local_only_truly_unpushed_refuses
@@ -574,3 +760,8 @@ test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses
+test_squash_merged_old_gh_allows
+test_old_gh_open_pr_unlanded_refuses
+test_content_fallback_old_git_allows
+test_content_fallback_old_git_unlanded_refuses
+test_dirty_worktree_old_tooling_refuses

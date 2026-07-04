@@ -18,7 +18,11 @@ BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 # it is installed (Homebrew, Nix profile bins, etc.), which the bare BASE_PATH may
 # not include. Prepended after the fakebin so the fake curl still wins.
 JQ_DIR=$(command -v jq 2>/dev/null) && JQ_DIR=$(dirname "$JQ_DIR") || JQ_DIR=
-[ -n "$JQ_DIR" ] && BASE_PATH="$JQ_DIR:$BASE_PATH"
+# The client under test hard-requires real jq; skip gracefully when it is absent
+# (mirrors the tmux guard in fm-afk-inject-e2e.test.sh). CI runs on ubuntu-latest
+# where jq is present, so this suite still runs in full there.
+[ -n "$JQ_DIR" ] || { echo "skip: jq not found"; exit 0; }
+BASE_PATH="$JQ_DIR:$BASE_PATH"
 TMP_ROOT=$(fm_test_tmproot fm-x-mode-tests)
 
 # A fakebin `curl` that mimics the relay: it reads its behavior from env

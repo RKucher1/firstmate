@@ -103,9 +103,18 @@ pr_number_from_branch() {
 
 # Is the worktree's PR merged for this exact HEAD? Resolves the PR from the
 # recorded pr= URL first, then from the branch name, and asks GitHub for both the
-# PR state and head. Returns non-zero when the PR is not merged, the current HEAD
-# is not the PR head, no PR is found, or any gh error occurs - the caller then
-# falls back to the content check.
+# PR state and head commit. Returns non-zero when the PR is not merged, the current
+# HEAD is not the PR head, the head cannot be resolved, no PR is found, or any gh
+# error occurs - the caller then falls back to the content check.
+#
+# The PR head commit is derived from the PR's commit list (the last commit is the
+# branch tip, exactly what the head ref points at) rather than the `headRefOid`
+# field, because older `gh` builds - like the one on this box - do not know that
+# field and error out, which would false-refuse a genuinely merged PR. `commits`
+# is a long-standing field, so this works on old and new gh alike while keeping the
+# same safety contract: pass ONLY when the PR is MERGED and HEAD equals its head
+# commit. gh-axi's `pr view` renders its own summary instead of honoring `--json`,
+# so the raw `gh` binary is used for this structured query.
 pr_is_merged() {
   local branch=$1 target view state head current
   if [ -n "$PR_URL" ]; then
@@ -114,7 +123,8 @@ pr_is_merged() {
     target=$(pr_number_from_branch "$branch") || return 1
   fi
   [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
+  view=$(cd "$WT" && gh pr view "$target" --json state,commits \
+    -q '.state + "\t" + ((.commits // []) | last | .oid // "")' 2>/dev/null) || return 1
   state=${view%%$'\t'*}
   head=${view#*$'\t'}
   [ "$state" != "$view" ] || return 1
@@ -127,13 +137,45 @@ pr_is_merged() {
   [ "$current" = "$head" ]
 }
 
+# Does `git merge-tree --write-tree` work here? That form needs Git 2.38+; older
+# gits (this box runs 2.34.1) reject `--write-tree` as an unknown rev. The probe is
+# a no-op 3-way self-merge of HEAD, so it has no worktree or index side effects; it
+# just tells content_in_default whether to take the modern path or the read-tree
+# fallback.
+git_supports_merge_tree_write_tree() {
+  git -C "$WT" merge-tree --write-tree HEAD HEAD >/dev/null 2>&1
+}
+
+# read-tree fallback for the merge-tree probe above, for Git < 2.38. Performs the
+# same 3-way merge of the default branch and HEAD (base = their merge-base) into a
+# throwaway index and writes the merged tree, without touching the worktree or the
+# real index. Returns 0 with the merged tree only on a clean merge; a content-level
+# conflict (which read-tree cannot trivially resolve) or any error returns non-zero,
+# so the caller stays conservative and refuses rather than guesses. Args: ref default_tree
+content_in_default_via_read_tree() {
+  local ref=$1 default_tree=$2 base tmp_index merged_tree rc=1
+  base=$(git -C "$WT" merge-base "$ref" HEAD 2>/dev/null) || return 1
+  [ -n "$base" ] || return 1
+  tmp_index=$(mktemp "${TMPDIR:-/tmp}/fm-teardown-idx.XXXXXX") || return 1
+  rm -f "$tmp_index"  # read-tree writes a fresh index; an empty pre-created file is rejected
+  if GIT_INDEX_FILE="$tmp_index" git -C "$WT" read-tree -m --aggressive "$base" "$ref" HEAD 2>/dev/null; then
+    merged_tree=$(GIT_INDEX_FILE="$tmp_index" git -C "$WT" write-tree 2>/dev/null) && rc=0
+  fi
+  rm -f "$tmp_index"
+  [ "$rc" -eq 0 ] || return 1
+  [ -n "$merged_tree" ] || return 1
+  [ "$merged_tree" = "$default_tree" ]
+}
+
 # Is the branch's content already present in the up-to-date default branch? Fetches
 # first, then 3-way merges the default branch with HEAD: when HEAD introduces nothing
 # the default branch does not already contain (e.g. its change landed via squash) the
 # merged tree equals the default branch's tree. This isolates branch-only changes, so
 # unrelated commits the default branch gained past the merge-base do not count as
-# "added". Returns non-zero when inconclusive (no default ref, or a merge conflict),
-# so the caller refuses rather than guesses.
+# "added". The merge uses `git merge-tree --write-tree` when available (Git 2.38+) and
+# an equivalent read-tree merge on older gits, so old-tooling boxes behave the same
+# instead of false-refusing. Returns non-zero when inconclusive (no default ref, or a
+# merge conflict), so the caller refuses rather than guesses.
 content_in_default() {
   local name ref default_tree merged_tree
   name=$(default_branch) || return 1
@@ -147,9 +189,13 @@ content_in_default() {
   fi
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
-  merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
-  [ "$merged_tree" = "$default_tree" ]
+  if git_supports_merge_tree_write_tree; then
+    merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
+    merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
+    [ "$merged_tree" = "$default_tree" ]
+  else
+    content_in_default_via_read_tree "$ref" "$default_tree"
+  fi
 }
 
 # Has the worktree's committed work actually LANDED, though its commits are not
