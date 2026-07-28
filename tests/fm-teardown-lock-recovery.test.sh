@@ -64,6 +64,8 @@ unset FM_STATE_OVERRIDE
 #   none      - nothing holds it (exit 1, no output: lsof's real "no match")
 #   warn-none - no match, but the routine unrelated-mount WARNING this very host
 #               emits is on stderr (exit 1, empty stdout). Still a real no-match.
+#   warn-target - same warning shape, but the mount it names CONTAINS the target,
+#               so lsof could not walk the target's own filesystem
 #   error     - lsof ran but could not answer FOR THIS TARGET (exit 1, a status
 #               error naming the path)
 #   crash     - lsof did not run to completion at all (non-1 exit)
@@ -82,6 +84,12 @@ case "${FM_LSOF_MODE:-none}" in
     # Verbatim shape from this host: any box with docker/NFS/autofs mounts emits
     # it on every run, and it says nothing about the target.
     printf '%s\n' "lsof: WARNING: can't stat() nsfs file system /run/docker/netns/default" \
+      "      Output information may be incomplete." >&2
+    exit 1
+    ;;
+  warn-target)
+    # Same shape, but the unwalkable filesystem is the one the target lives on.
+    printf '%s\n' "lsof: WARNING: can't stat() nfs file system $(dirname "$target")" \
       "      Output information may be incomplete." >&2
     exit 1
     ;;
@@ -163,6 +171,43 @@ test_holder_probe_unrelated_warning_is_still_no_holder() {
   pass "an unrelated lsof mount WARNING is a diagnostic, not evidence: still no holder"
 }
 
+# The other direction of the same rule: that leniency is scoped to OTHER
+# filesystems. When the mount a warning names contains the target, lsof could not
+# enumerate the target's own filesystem, so empty stdout says nothing - and NONE
+# plus an old mtime is the branch that deletes the file.
+test_holder_probe_target_filesystem_warning_is_unknown() {
+  local rc=0
+  with_lsof warn-target worktree_lock_holder_state "$TMP_ROOT/some.lock" "$TMP_ROOT" 2>/dev/null || rc=$?
+  [ "$rc" -eq 2 ] || fail "holder probe: a warning about the TARGET's own filesystem must be UNKNOWN (2), got $rc"
+  pass "an lsof warning covering the target's own filesystem is UNKNOWN, never 'no holder'"
+}
+
+# A hung NFS/autofs mount is exactly the host this recovery runs on, so the probe
+# is capped where a timeout binary exists - and a probe cut short is UNKNOWN.
+test_holder_probe_timeout_is_unknown() {
+  local fakebin="$TMP_ROOT/timeout-fakebin" rc=0 err
+  mkdir -p "$fakebin"
+  make_lsof_stub "$fakebin"
+  cat > "$fakebin/timeout" <<'SH'
+#!/usr/bin/env bash
+exit 124
+SH
+  chmod +x "$fakebin/timeout"
+
+  err=$(
+    (
+      export PATH="$fakebin:$PATH" FM_LSOF_MODE=none
+      worktree_lock_holder_state "$TMP_ROOT/some.lock" "$TMP_ROOT"
+    ) 2>&1
+  ) || rc=$?
+  [ "$rc" -eq 2 ] || fail "holder probe: a timed-out lsof must be UNKNOWN (2), never NONE; got $rc"
+  case "$err" in
+    *"timed out after"*) ;;
+    *) fail "holder probe: a timed-out lsof must say so; got: $err" ;;
+  esac
+  pass "a timed-out lsof probe is UNKNOWN and says why"
+}
+
 test_holder_probe_missing_lsof_is_unknown() {
   local rc=0
   without_lsof worktree_lock_holder_state "$TMP_ROOT/some.lock" "$TMP_ROOT" || rc=$?
@@ -228,6 +273,28 @@ test_junk_staleness_threshold_cannot_skip_the_age_proof() {
       || fail "staleness threshold '$bad' let a fresh lock pass the age proof"
   done
   pass "an invalid staleness threshold falls back to the default instead of skipping the age proof"
+}
+
+# Teardown blocks in the foreground for this wait, so its ceiling must belong to
+# the code: a large threshold must not be able to stretch it into a long stall.
+test_judgeable_wait_cap_is_clamped_by_code_not_env() {
+  local lock out
+  lock=$(make_lock wait-cap old)
+  out=$(
+    (
+      export FM_STATE_OVERRIDE="$TMP_ROOT/lib-state" FM_STALE_WORKTREE_LOCK_AGE_SECS=3600
+      # shellcheck source=bin/fm-wake-lib.sh
+      . "$ROOT/bin/fm-wake-lib.sh"
+      # shellcheck source=/dev/null
+      . "$LOCK_LIB"
+      worktree_lock_wait_until_judgeable "$lock" worktree
+    ) 2>&1
+  ) || fail "wait cap: an already-judgeable lock should return at once"
+  assert_contains "$out" "waiting up to 60s" \
+    "wait cap: the announced wait must be the code's absolute cap, not threshold + margin"
+  assert_not_contains "$out" "waiting up to 3605s" \
+    "wait cap: a large staleness threshold must not stretch the foreground wait"
+  pass "the judge-able wait is capped by the code, not by whoever sets the threshold"
 }
 
 test_index_lock_signature_matches_git_only() {
@@ -680,9 +747,12 @@ test_holder_probe_reports_live_holder
 test_holder_probe_reports_no_holder
 test_holder_probe_errors_are_unknown_not_none
 test_holder_probe_unrelated_warning_is_still_no_holder
+test_holder_probe_target_filesystem_warning_is_unknown
+test_holder_probe_timeout_is_unknown
 test_holder_probe_missing_lsof_is_unknown
 test_provably_stale_only_when_both_proofs_hold
 test_junk_staleness_threshold_cannot_skip_the_age_proof
+test_judgeable_wait_cap_is_clamped_by_code_not_env
 test_index_lock_signature_matches_git_only
 test_live_held_lock_is_never_removed
 test_provably_stale_lock_is_removed_and_return_retried

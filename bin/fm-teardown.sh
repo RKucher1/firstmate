@@ -431,7 +431,7 @@ safe_rm_rf_child_worktree() {
 # change them. Diff against those two commits if upstream later fixes something
 # we did not take.
 #
-# Two behaviors here DELIBERATELY DIVERGE from those upstream commits, because
+# Three behaviors here DELIBERATELY DIVERGE from those upstream commits, because
 # upstream's versions make its own stale-removal path unreachable in practice:
 #   1. lsof classification reads stdout, not merged output. Upstream captures
 #      `lsof <path> 2>&1` and calls any output an error, so a routine unrelated
@@ -439,13 +439,23 @@ safe_rm_rf_child_worktree() {
 #      host with docker/NFS/autofs mounts) turns a genuine no-match into UNKNOWN
 #      and no lock is ever provably stale. We run `lsof -t`, whose stdout is PIDs
 #      only, judge on that, and keep stderr as a printed diagnostic - while still
-#      returning UNKNOWN whenever lsof could not actually run or complete.
+#      returning UNKNOWN whenever lsof could not actually run or complete. That
+#      leniency is scoped: a "can't stat() ... file system <mount>" warning whose
+#      mount CONTAINS the probe target means lsof could not enumerate the target's
+#      own filesystem, so its silence is not evidence and the answer is UNKNOWN.
 #   2. the retry window is followed by a bounded wait until the lock is old enough
 #      to judge. Upstream pairs a 30s staleness threshold with a 3x1s retry
 #      window, so a lock born DURING teardown (the exact case the port exists for:
 #      `treehouse return --force` killing a git process mid-operation) can never
 #      reach its own threshold and is always refused. We wait out the difference,
 #      capped, and then re-prove staleness on a fresh read.
+#   3. the lsof probe itself is bounded to $LSOF_PROBE_TIMEOUT_SECS seconds when a
+#      `timeout`/`gtimeout` binary exists. lsof stats the whole mount table and can
+#      block forever on a hung NFS/autofs mount - the very hosts this path targets -
+#      and upstream leaves that unbounded. A timed-out probe is UNKNOWN, never NONE,
+#      so the bound can only ever refuse a removal. Where no timeout binary exists
+#      (stock macOS) the probe runs unwrapped rather than degrading to a permanent
+#      UNKNOWN that would disable the removal path on that platform entirely.
 #
 # A crew process killed mid-git-operation can leave a
 # .git/worktrees/<wt>/index.lock (or, for a non-linked repo, .git/index.lock)
@@ -470,15 +480,23 @@ safe_rm_rf_child_worktree() {
 #
 # A lock too YOUNG to judge is the one refusal worth waiting out, so the retries
 # are followed by a bounded wait of at most $STALE_WORKTREE_LOCK_AGE_SECS +
-# $STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS seconds. The timer is never itself the
+# $STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS seconds, itself hard-capped at
+# $STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS so the bound is a property of this code
+# rather than of whoever set the threshold env var. The timer is never itself the
 # proof: when it ends, the age and the holder check are BOTH re-read and removal
 # happens only if worktree_lock_is_provably_stale passes on that fresh read.
 STALE_WORKTREE_LOCK_AGE_SECS=${FM_STALE_WORKTREE_LOCK_AGE_SECS:-30}
 # Margin on top of the threshold so a lock that ages into judge-ability right at
 # the boundary is still judged; the wait can never exceed threshold + margin.
 STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS=5
+# Absolute ceiling on that wait. Teardown blocks in the foreground while it runs,
+# and firstmate must not sit in a long foreground operation with tasks in flight,
+# so no threshold setting can stretch the wait past this.
+STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS=60
+# Ceiling on a single lsof probe, applied only when timeout/gtimeout exists.
+LSOF_PROBE_TIMEOUT_SECS=5
 TREEHOUSE_RETURN_LOCK_RETRIES=${FM_TREEHOUSE_RETURN_LOCK_RETRIES:-3}
-TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS=${FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS:-${FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS:-1}}
+TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS=${FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS:-1}
 # Tri-state answer to "does anything still hold this?". UNKNOWN is never stale.
 LOCK_HOLDER_LIVE=0
 LOCK_HOLDER_NONE=1
@@ -534,16 +552,69 @@ worktree_git_lock_path() {
   esac
 }
 
-# Is everything lsof wrote to stderr an unrelated-filesystem WARNING? Those
-# ("lsof: WARNING: can't stat() nsfs file system /run/docker/netns/default" plus
-# its indented continuation) are routine on any host with docker, NFS or autofs
-# mounts and say nothing about the target, so they are noise. This is a
-# whitelist, not a blacklist: ANY other diagnostic - a status error on the target
-# path, a usage error, a missing pwd entry - means lsof did not answer for this
-# path, and an unrecognized one is treated the same way.
+# The mountpoint named by an lsof "can't stat() <fstype> file system <path>"
+# warning, or nothing for any other line.
+lsof_warning_mount_path() {
+  case "$1" in
+    "lsof: WARNING: can't stat()"*" file system "*)
+      printf '%s\n' "${1#*" file system "}"
+      ;;
+  esac
+}
+
+# Is $path the same as, or inside, directory $ancestor? Pure string comparison:
+# a match it misses only leaves today's classification in place, while the
+# matches it makes are what push a doubtful probe to UNKNOWN.
+path_is_within() {
+  local ancestor=$1 path=$2
+  [ -n "$ancestor" ] && [ -n "$path" ] || return 1
+  case "$ancestor" in */) ancestor=${ancestor%/} ;; esac
+  if [ -z "$ancestor" ]; then
+    case "$path" in /*) return 0 ;; *) return 1 ;; esac
+  fi
+  [ "$path" = "$ancestor" ] && return 0
+  case "$path" in "$ancestor"/*) return 0 ;; esac
+  return 1
+}
+
+# Is everything lsof wrote to stderr while probing $2 a warning about some OTHER
+# filesystem? Those ("lsof: WARNING: can't stat() nsfs file system
+# /run/docker/netns/default" plus its indented continuation) are routine on any
+# host with docker, NFS or autofs mounts and say nothing about the target, so
+# they are noise. This is a whitelist, not a blacklist: ANY other diagnostic - a
+# status error on the target path, a usage error, a missing pwd entry - means
+# lsof did not answer for this path, and an unrecognized one is treated the same
+# way. The whitelist is scoped to OTHER filesystems: when the mount a warning
+# names contains the probe target, lsof could not walk the target's own
+# filesystem, so its silence about the target is not evidence either.
 lsof_diagnostics_are_benign() {
-  [ -n "$1" ] || return 0
-  ! printf '%s\n' "$1" | grep -qv -e '^lsof: WARNING:' -e '^[[:space:]]' -e '^$'
+  local err=$1 target=$2 line mount
+  [ -n "$err" ] || return 0
+  if printf '%s\n' "$err" | grep -qv -e '^lsof: WARNING:' -e '^[[:space:]]' -e '^$'; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    mount=$(lsof_warning_mount_path "$line")
+    [ -n "$mount" ] || continue
+    if path_is_within "$mount" "$target"; then
+      return 1
+    fi
+  done <<EOF
+$err
+EOF
+  return 0
+}
+
+# `timeout`/`gtimeout` binary to bound an lsof probe with, or nothing when the
+# host has neither (stock macOS).
+lsof_probe_timeout_bin() {
+  local bin
+  for bin in timeout gtimeout; do
+    if command -v "$bin" >/dev/null 2>&1; then
+      printf '%s\n' "$bin"
+      return 0
+    fi
+  done
 }
 
 # Does any live process hold $target open? LIVE / NONE / UNKNOWN.
@@ -554,16 +625,29 @@ lsof_diagnostics_are_benign() {
 # this". Empty stdout is NONE only when lsof actually RAN and finished: a missing
 # binary (caught by the caller's command -v guard), a non-1 exit, an unreadable
 # target, or any diagnostic outside the benign set is UNKNOWN, never no-holder.
+#
+# The probe is capped at $LSOF_PROBE_TIMEOUT_SECS seconds wherever a timeout
+# binary exists, so a hung mount cannot wedge teardown; a probe cut short that way
+# is UNKNOWN whatever it managed to print, so the cap can only refuse a removal.
 lsof_path_holder_state() {
-  local target=$1 pids errfile err status=0
+  local target=$1 pids errfile err status=0 timeout_bin
   errfile=$(mktemp "${TMPDIR:-/tmp}/fm-teardown-lsof.XXXXXX" 2>/dev/null) || {
     echo "teardown: could not stage the lsof check for $target, so it is no evidence" >&2
     return "$LOCK_HOLDER_UNKNOWN"
   }
-  pids=$(lsof -t -- "$target" 2>"$errfile") || status=$?
+  timeout_bin=$(lsof_probe_timeout_bin)
+  if [ -n "$timeout_bin" ]; then
+    pids=$("$timeout_bin" "$LSOF_PROBE_TIMEOUT_SECS" lsof -t -- "$target" 2>"$errfile") || status=$?
+  else
+    pids=$(lsof -t -- "$target" 2>"$errfile") || status=$?
+  fi
   err=$(cat "$errfile" 2>/dev/null || true)
   rm -f "$errfile"
   [ -z "$err" ] || printf '%s\n' "$err" | sed 's/^/teardown: lsof: /' >&2
+  if [ -n "$timeout_bin" ] && { [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; }; then
+    echo "teardown: lsof check for $target timed out after ${LSOF_PROBE_TIMEOUT_SECS}s, so it is no evidence" >&2
+    return "$LOCK_HOLDER_UNKNOWN"
+  fi
   if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
     echo "teardown: lsof check for $target could not run (exit $status), so it is no evidence" >&2
     return "$LOCK_HOLDER_UNKNOWN"
@@ -581,7 +665,7 @@ lsof_path_holder_state() {
     echo "teardown: lsof check for $target reported a match but named no process, so it is no evidence" >&2
     return "$LOCK_HOLDER_UNKNOWN"
   fi
-  if lsof_diagnostics_are_benign "$err"; then
+  if lsof_diagnostics_are_benign "$err" "$target"; then
     return "$LOCK_HOLDER_NONE"
   fi
   echo "teardown: lsof check for $target did not complete cleanly, so it is no evidence" >&2
@@ -654,15 +738,18 @@ worktree_lock_is_provably_stale() {
 }
 
 # Wait, BOUNDED, for a lock that is merely too young to be judged. The cap is
-# $STALE_WORKTREE_LOCK_AGE_SECS + $STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS seconds
-# and the loop can never run past it; a lock born during teardown (age ~0s)
-# otherwise outlives the short retry window without ever becoming judge-able.
+# $STALE_WORKTREE_LOCK_AGE_SECS + $STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS seconds,
+# itself clamped to $STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS so no threshold setting
+# can stretch this foreground wait, and the loop can never run past it; a lock born
+# during teardown (age ~0s) otherwise outlives the short retry window without ever
+# becoming judge-able.
 # Returns as soon as the lock is old enough, vanishes, or the cap is reached -
 # and NONE of those outcomes is proof of anything. The caller must re-run
 # worktree_lock_is_provably_stale on a fresh read before removing anything.
 worktree_lock_wait_until_judgeable() {
   local lock=$1 label=$2 cap deadline now age
   cap=$(( STALE_WORKTREE_LOCK_AGE_SECS + STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS ))
+  [ "$cap" -le "$STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS" ] || cap=$STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS
   now=$(date +%s) || return 1
   case "$now" in ''|*[!0-9]*) return 1 ;; esac
   deadline=$(( now + cap ))
