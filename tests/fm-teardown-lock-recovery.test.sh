@@ -37,16 +37,19 @@ mkdir -p "$TMP_ROOT"
 #
 # The block is delimited in fm-teardown.sh by FM-LOCK-RECOVERY-BEGIN/END so the
 # safety predicates can be unit-tested without a real killed git process (and
-# without a test-only seam in the production script). removal_target_abs_path is
-# the one same-file helper the block leans on, so it comes along verbatim rather
-# than being re-implemented here.
+# without a test-only seam in the production script). removal_target_abs_path and
+# path_is_ancestor_of are the same-file helpers the block leans on, so they come
+# along verbatim rather than being re-implemented here.
 LOCK_LIB="$TMP_ROOT/lock-recovery-lib.sh"
 {
   sed -n '/^removal_target_abs_path() {/,/^}/p' "$TEARDOWN"
+  sed -n '/^path_is_ancestor_of() {/,/^}/p' "$TEARDOWN"
   sed -n '/^# FM-LOCK-RECOVERY-BEGIN/,/^# FM-LOCK-RECOVERY-END/p' "$TEARDOWN"
 } > "$LOCK_LIB"
 grep -q '^removal_target_abs_path() {' "$LOCK_LIB" \
   || fail "could not extract removal_target_abs_path from fm-teardown.sh"
+grep -q '^path_is_ancestor_of() {' "$LOCK_LIB" \
+  || fail "could not extract path_is_ancestor_of from fm-teardown.sh"
 grep -q '^worktree_lock_is_provably_stale() {' "$LOCK_LIB" \
   || fail "could not extract the FM-LOCK-RECOVERY block from fm-teardown.sh"
 
@@ -297,6 +300,76 @@ test_judgeable_wait_cap_is_clamped_by_code_not_env() {
   pass "the judge-able wait is capped by the code, not by whoever sets the threshold"
 }
 
+# The resolved lock path is both the lsof probe target and the `rm -f` target, so
+# it must describe THIS worktree and nothing else. `git -C` does not override an
+# inherited GIT_DIR/GIT_WORK_TREE, and in a treehouse pool every worktree shares
+# one repo - so an ambient GIT_DIR would point the probe, and the removal, at the
+# shared parent repo's index.lock while the real worktree lock sat untouched.
+test_lock_path_ignores_ambient_git_env() {
+  local repo wt other resolved expected
+  repo="$TMP_ROOT/gitenv-repo"
+  wt="$TMP_ROOT/gitenv-wt"
+  other="$TMP_ROOT/gitenv-other"
+  fm_git_init_commit "$repo"
+  git -C "$repo" worktree add -q --detach "$wt" HEAD
+  fm_git_init_commit "$other"
+
+  expected=$(worktree_git_lock_path "$wt") \
+    || fail "git-env: could not resolve the worktree lock path at all"
+
+  resolved=$(
+    GIT_DIR="$other/.git" GIT_WORK_TREE="$other" GIT_INDEX_FILE="$other/.git/index" \
+      worktree_git_lock_path "$wt"
+  ) || resolved=""
+
+  case "$resolved" in
+    "$other"/*)
+      fail "git-env: an ambient GIT_DIR redirected the lock path to another repo ($resolved) - that path would be probed and rm'd"
+      ;;
+  esac
+  [ "$resolved" = "$expected" ] \
+    || fail "git-env: expected the worktree's own lock '$expected', got '$resolved'"
+  pass "an ambient GIT_DIR cannot redirect the lock path off the worktree"
+}
+
+# The resolved path is only trustworthy if it is actually this worktree's index
+# lock; anything else must be unresolvable rather than a removal target.
+test_lock_path_rejects_a_foreign_resolution() {
+  local outside
+  outside="$TMP_ROOT/gitenv-outside"
+  mkdir -p "$outside"
+  worktree_git_lock_path "$outside" >/dev/null 2>&1 \
+    && fail "git-env: a directory that is not a git worktree must not resolve to a lock path"
+  pass "a non-worktree directory resolves to no lock path at all"
+}
+
+# The wait exists to let a too-young lock age into judge-ability. When the code's
+# own cap cannot possibly carry it to the threshold, waiting is a guaranteed-
+# useless foreground stall - and teardown must not sit in one.
+test_futile_wait_is_skipped_rather_than_stalling() {
+  local lock started elapsed out rc=0
+  lock=$(make_lock futile-wait fresh)
+  started=$(date +%s)
+  out=$(
+    (
+      export FM_STATE_OVERRIDE="$TMP_ROOT/lib-state" FM_STALE_WORKTREE_LOCK_AGE_SECS=3600
+      # shellcheck source=bin/fm-wake-lib.sh
+      . "$ROOT/bin/fm-wake-lib.sh"
+      # shellcheck source=/dev/null
+      . "$LOCK_LIB"
+      worktree_lock_wait_until_judgeable "$lock" worktree
+    ) 2>&1
+  ) || rc=$?
+  elapsed=$(( $(date +%s) - started ))
+
+  [ "$rc" -ne 0 ] || fail "futile-wait: a lock that can never age past the threshold must not report success"
+  [ "$elapsed" -lt 10 ] \
+    || fail "futile-wait: teardown stalled ${elapsed}s in the foreground on a wait that could never succeed"
+  assert_not_contains "$out" "waiting up to" \
+    "futile-wait: a wait that cannot reach the threshold must not be announced at all"
+  pass "a wait that could never reach the threshold is skipped, not stalled through"
+}
+
 test_index_lock_signature_matches_git_only() {
   treehouse_return_is_index_lock_error \
     "fatal: Unable to create '/p/.git/worktrees/wt/index.lock': File exists." \
@@ -334,6 +407,12 @@ if [ "$fail" -eq 1 ]; then
   echo "treehouse: worktree return failed" >&2
   exit 1
 fi
+# A real `treehouse return --force` cleans, resets and returns the worktree to the
+# pool, which leaves it detached and no longer holding the task branch. Model that,
+# or the branch-drop assertions would be testing a fiction: `git branch -D` refuses
+# a branch that is still checked out somewhere.
+for arg in "$@"; do :; done
+[ -d "$arg" ] && git -C "$arg" checkout --detach -q 2>/dev/null
 exit 0
 SH
   cat > "$fakebin/tmux" <<'SH'
@@ -574,22 +653,27 @@ test_waited_out_lock_is_reproved_not_assumed() {
 
 # A removal that did not happen must never be logged as one: this stderr trail is
 # the audit record for the one branch that deletes another process's file.
+#
+# The removal is made to fail by making the lock a NON-EMPTY DIRECTORY, which
+# `rm -f` refuses on every host. An earlier version used `chmod 555` on the
+# parent directory, which root ignores - so the rm succeeded, the lock vanished,
+# and the suite went red for an environmental reason instead of a regression.
 test_failed_removal_is_not_reported_as_a_removal() {
-  local case_dir lock lockdir rc stderr
+  local case_dir lock rc stderr
   case_dir=$(make_case unremovable)
-  lock=$(plant_lock "$case_dir" old)
-  lockdir=$(dirname "$lock")
-  chmod 555 "$lockdir"
+  lock=$(case_lock_path "$case_dir") || fail "unremovable: could not resolve the lock path"
+  mkdir -p "$lock"
+  : > "$lock/occupant"
+  touch -t 202001010000 "$lock"
 
   set +e
   run_teardown_case "$case_dir" ok-when-lock-gone none --force \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
-  chmod 755 "$lockdir"
   stderr=$(cat "$case_dir/stderr")
 
-  assert_present "$lock" "unremovable: the lock should still be there - the directory is read-only"
+  assert_present "$lock" "unremovable: the lock should still be there - rm -f cannot remove a non-empty directory"
   assert_not_contains "$stderr" "removed provably-stale" \
     "unremovable: a removal that failed must not be logged as a removal"
   assert_contains "$stderr" "could not be removed" \
@@ -598,6 +682,60 @@ test_failed_removal_is_not_reported_as_a_removal() {
     "unremovable: teardown must not imply the worktree was returned"
   expect_code 0 "$rc" "unremovable: teardown still completes its window/meta cleanup"
   pass "a stale-lock removal that fails is reported as a failure, never as a removal"
+}
+
+# --- G. the task-branch drop is tied to the return actually happening --------
+#
+# The drop used to run BEFORE the return, and it needs to write the index
+# (`git checkout --detach`), so the very lock this recovery exists to clear also
+# blocked the drop - every rescued teardown leaked its fm/<id> ref into the
+# shared pool repo. It now runs after a successful return, against the project
+# repo, where no worktree index lock can reach it.
+
+# Is the task branch still present in the case's project repo?
+case_branch_exists() {
+  git -C "$1/project" show-ref --verify --quiet refs/heads/fm/task-x1
+}
+
+test_branch_is_dropped_after_a_recovered_return() {
+  local case_dir lock rc
+  case_dir=$(make_case branch-drop-recovered)
+  lock=$(plant_lock "$case_dir" old)
+
+  case_branch_exists "$case_dir" || fail "branch-drop-recovered: fixture should start with the task branch"
+
+  set +e
+  run_teardown_case "$case_dir" ok-when-lock-gone none --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "branch-drop-recovered: teardown should complete"
+  assert_absent "$lock" "branch-drop-recovered: the stale lock should have been removed"
+  ! case_branch_exists "$case_dir" \
+    || fail "branch-drop-recovered: the task branch leaked into the pool repo after a rescued return"
+  pass "G: a lock-recovered return still drops the task branch"
+}
+
+test_branch_is_kept_when_the_return_was_refused() {
+  local case_dir lock rc stderr
+  case_dir=$(make_case branch-drop-refused)
+  lock=$(plant_lock "$case_dir" old)
+
+  set +e
+  run_teardown_case "$case_dir" always-lock holder --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  stderr=$(cat "$case_dir/stderr")
+
+  assert_present "$lock" "branch-drop-refused: a live-held lock must never be removed"
+  assert_contains "$stderr" "NOT returned" "branch-drop-refused: the refusal must be reported"
+  # The worktree still holds that branch checked out, so dropping it would strand
+  # the work the refusal exists to protect.
+  case_branch_exists "$case_dir" \
+    || fail "branch-drop-refused: the task branch was dropped even though the worktree was never returned"
+  pass "G2: a refused return leaves the task branch alone"
 }
 
 # --- F. the secondmate home call site ---------------------------------------
@@ -753,6 +891,9 @@ test_holder_probe_missing_lsof_is_unknown
 test_provably_stale_only_when_both_proofs_hold
 test_junk_staleness_threshold_cannot_skip_the_age_proof
 test_judgeable_wait_cap_is_clamped_by_code_not_env
+test_lock_path_ignores_ambient_git_env
+test_lock_path_rejects_a_foreign_resolution
+test_futile_wait_is_skipped_rather_than_stalling
 test_index_lock_signature_matches_git_only
 test_live_held_lock_is_never_removed
 test_provably_stale_lock_is_removed_and_return_retried
@@ -761,6 +902,8 @@ test_transient_lock_recovers_on_retry_without_removal
 test_too_young_lock_is_waited_out_then_removed
 test_waited_out_lock_is_reproved_not_assumed
 test_failed_removal_is_not_reported_as_a_removal
+test_branch_is_dropped_after_a_recovered_return
+test_branch_is_kept_when_the_return_was_refused
 test_secondmate_home_return_recovers_a_stale_lock
 test_secondmate_home_return_refusal_aborts_teardown
 test_non_lock_failure_does_not_enter_lock_recovery

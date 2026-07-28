@@ -471,6 +471,17 @@ safe_rm_rf_child_worktree() {
 #      the worktree directory open (cwd or fd). A live git process keeps its own
 #      lock open for the whole operation, so "nothing holds it" means the file was
 #      abandoned by a process that has since exited - not that nobody ever held it.
+#      The worktree-directory half does not make this proof unsatisfiable, though
+#      it runs before `tmux kill-window`: `treehouse return --force` terminates the
+#      worktree's lingering processes - the crew agent and its pane shell, whose
+#      cwd is the worktree - BEFORE the git step that fails on the lock ("Terminate
+#      lingering processes and return a worktree", per `treehouse return --help`
+#      and the call site below). So by the time this probe runs, the pane is
+#      already gone and cannot register as a false holder. The dir half stays
+#      because it is what catches a process holding the WORKTREE without holding
+#      the lock file itself, which a lock-file-only probe would miss; and if
+#      treehouse's termination ever misses something, this refuses the removal,
+#      which is the fail-safe direction.
 #   2. the lock's mtime age is at least $STALE_WORKTREE_LOCK_AGE_SECS. A lock
 #      created moments ago may belong to a process lsof has not reflected yet.
 # If lsof is missing, errors, or otherwise cannot answer, that is UNKNOWN, not
@@ -536,20 +547,49 @@ case "$STALE_WORKTREE_LOCK_AGE_SECS" in
     ;;
 esac
 
+# git with the ambient repo-selecting variables cleared. `git -C <dir>` does NOT
+# override an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE: git obeys those and
+# ignores <dir>'s own repository. Every treehouse worktree shares one repo, so an
+# ambient GIT_DIR would resolve the shared PARENT repo's index.lock here - and
+# that path is what gets probed and, if judged stale, removed.
+git_without_ambient_repo_env() {
+  ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; git "$@" )
+}
+
 # Absolute path of the git index lock for a worktree or repo dir. Non-zero when
-# it cannot be resolved (dir missing, or not a git worktree at all).
+# it cannot be resolved (dir missing, not a git worktree, or the resolved path is
+# not credibly this worktree's own index lock).
+#
+# The result is both the lsof probe target and the `rm -f` target, so it is
+# validated before it is handed back rather than trusted: the basename must be
+# index.lock, and it must live under the worktree itself or under that worktree's
+# common git dir (where a linked worktree's lock actually sits). Every other
+# removal in this file goes through validate_removal_target for the same reason -
+# an untrusted path must never reach rm.
 worktree_git_lock_path() {
-  local dir=$1 lock abs_dir
+  local dir=$1 lock abs_dir abs_lock common
   [ -n "$dir" ] && [ -d "$dir" ] || return 1
-  lock=$(git -C "$dir" rev-parse --git-path index.lock 2>/dev/null) || return 1
+  lock=$(git_without_ambient_repo_env -C "$dir" rev-parse --git-path index.lock 2>/dev/null) || return 1
   [ -n "$lock" ] || return 1
+  abs_dir=$(removal_target_abs_path "$dir") || return 1
   case "$lock" in
-    /*) printf '%s\n' "$lock" ;;
-    *)
-      abs_dir=$(removal_target_abs_path "$dir") || return 1
-      printf '%s/%s\n' "$abs_dir" "$lock"
-      ;;
+    /*) abs_lock=$lock ;;
+    *)  abs_lock="$abs_dir/$lock" ;;
   esac
+  [ "$(basename "$abs_lock")" = index.lock ] || return 1
+  if path_is_within "$abs_dir" "$abs_lock"; then
+    printf '%s\n' "$abs_lock"
+    return 0
+  fi
+  common=$(git_without_ambient_repo_env -C "$dir" rev-parse --git-common-dir 2>/dev/null) || common=""
+  [ -n "$common" ] || return 1
+  case "$common" in
+    /*) : ;;
+    *) common="$abs_dir/$common" ;;
+  esac
+  common=$(removal_target_abs_path "$common" 2>/dev/null) || return 1
+  path_is_within "$common" "$abs_lock" || return 1
+  printf '%s\n' "$abs_lock"
 }
 
 # The mountpoint named by an lsof "can't stat() <fstype> file system <path>"
@@ -565,16 +605,19 @@ lsof_warning_mount_path() {
 # Is $path the same as, or inside, directory $ancestor? Pure string comparison:
 # a match it misses only leaves today's classification in place, while the
 # matches it makes are what push a doubtful probe to UNKNOWN.
+#
+# The prefix test itself is path_is_ancestor_of's; this only adds the two cases
+# that helper deliberately excludes - an exact match, and "/" as the ancestor -
+# so the file keeps ONE implementation of "is this path under that one".
 path_is_within() {
   local ancestor=$1 path=$2
   [ -n "$ancestor" ] && [ -n "$path" ] || return 1
   case "$ancestor" in */) ancestor=${ancestor%/} ;; esac
+  # "/" trims to empty: every absolute path is inside the root.
   if [ -z "$ancestor" ]; then
     case "$path" in /*) return 0 ;; *) return 1 ;; esac
   fi
-  [ "$path" = "$ancestor" ] && return 0
-  case "$path" in "$ancestor"/*) return 0 ;; esac
-  return 1
+  [ "$path" = "$ancestor" ] || path_is_ancestor_of "$ancestor" "$path"
 }
 
 # Is everything lsof wrote to stderr while probing $2 a warning about some OTHER
@@ -615,6 +658,10 @@ lsof_probe_timeout_bin() {
       return 0
     fi
   done
+  # Explicit: without this the function would exit with the last `command -v`
+  # status, making the no-timeout-binary case (stock macOS - the platform the
+  # unwrapped probe exists to support) a FAILING function under set -eu.
+  return 0
 }
 
 # Does any live process hold $target open? LIVE / NONE / UNKNOWN.
@@ -750,6 +797,15 @@ worktree_lock_wait_until_judgeable() {
   local lock=$1 label=$2 cap deadline now age
   cap=$(( STALE_WORKTREE_LOCK_AGE_SECS + STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS ))
   [ "$cap" -le "$STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS" ] || cap=$STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS
+  # Once the cap bites, waiting can become arithmetically futile: with a threshold
+  # above the cap, the lock cannot reach judge-ability inside the wait no matter
+  # what, so sitting here would be a guaranteed-useless foreground stall in the
+  # one operation AGENTS.md section 8 says must not block. Refuse up front instead.
+  age=$(worktree_lock_age "$lock") || return 1
+  if [ "$(( age + cap ))" -lt "$STALE_WORKTREE_LOCK_AGE_SECS" ]; then
+    echo "teardown: $label index.lock $lock is ${age}s old and the bounded ${cap}s wait cannot reach the ${STALE_WORKTREE_LOCK_AGE_SECS}s staleness threshold; refusing now rather than stalling" >&2
+    return 1
+  fi
   now=$(date +%s) || return 1
   case "$now" in ''|*[!0-9]*) return 1 ;; esac
   deadline=$(( now + cap ))
@@ -1056,14 +1112,13 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-# Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+  # Note the task branch while the worktree is still ours to read. The DROP itself
+  # happens after the return, not here: dropping it here needs `git checkout
+  # --detach`, which writes the index, so the very index.lock this teardown exists
+  # to recover from also blocked the drop - and every lock-rescued teardown then
+  # leaked its fm/<id> ref into the shared pooled repo.
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-  if [ "$branch" != "HEAD" ]; then
-    if git -C "$WT" checkout --detach -q 2>/dev/null; then
-      git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
-    fi
-  fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   # Reap a watcher that ran as THIS worktree's own firstmate home. A self-dev home
@@ -1092,6 +1147,16 @@ if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     echo "ERROR: teardown: worktree $WT was NOT returned - its git index.lock could not be safely recovered (see above). Continuing so the window and meta are still cleared; rerun 'treehouse return --force $WT' once the lock is resolved." >&2
   elif [ "$return_rc" -ne 0 ]; then
     echo "warning: treehouse return --force failed for $WT (rerun it manually); continuing teardown so the window and meta are still cleared" >&2
+  fi
+  # Best-effort: drop the local task branch so the shared repo does not accumulate
+  # refs - but ONLY once the worktree was actually returned. The return releases
+  # the worktree, so the branch is no longer checked out anywhere and `branch -D`
+  # against the project repo cannot be blocked by any worktree index lock. When the
+  # return did NOT happen (the lock-refused path, or the F11 warn-and-continue
+  # path) the branch is deliberately left alone: its work is still sitting checked
+  # out in that worktree, and dropping the ref would strand it.
+  if [ "$return_rc" -eq 0 ] && [ -n "$branch" ] && [ "$branch" != HEAD ]; then
+    git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
   fi
 fi
 
