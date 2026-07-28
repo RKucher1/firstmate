@@ -32,6 +32,10 @@
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
 #   when the captain has explicitly said to discard the work.
+# A crew process killed mid-git-operation can leave a stale git index.lock behind
+# that makes the worktree return fail; teardown_treehouse_return recovers from it
+# with bounded patience and, only for a provably-stale lock, removal. See the
+# FM-LOCK-RECOVERY block below for the full safety proof.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,6 +47,8 @@ SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
 # shellcheck source=bin/fm-tasks-axi-lib.sh
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"   # fm_path_mtime, used by the lock-recovery block
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 FORCE=${2:-}
@@ -411,6 +417,511 @@ safe_rm_rf_child_worktree() {
   rm -rf -- "$target"
 }
 
+# FM-LOCK-RECOVERY-BEGIN
+# Transient / stale worktree git index.lock recovery.
+#
+# Hand-ported from upstream firstmate (kunchenguid/firstmate): commit 678f2b5
+# (PR #296, "recover provably stale git index locks") and commit 38086ea (PR
+# #435, "retry transient index locks during worktree return"). Ported by hand to
+# this file's conventions rather than cherry-picked, and deliberately narrower:
+# upstream routes its returns through a runtime-backend abstraction
+# (bin/fm-backend.sh) that this teardown does not have and must not grow, and
+# upstream's companion "safety inspection itself blocked by the lock" path is not
+# taken here - our landed-work checks run before the return and this fix does not
+# change them. Diff against those two commits if upstream later fixes something
+# we did not take.
+#
+# Three behaviors here DELIBERATELY DIVERGE from those upstream commits, because
+# upstream's versions make its own stale-removal path unreachable in practice:
+#   1. lsof classification reads stdout, not merged output. Upstream captures
+#      `lsof <path> 2>&1` and calls any output an error, so a routine unrelated
+#      warning ("lsof: WARNING: can't stat() nsfs file system ...", emitted on any
+#      host with docker/NFS/autofs mounts) turns a genuine no-match into UNKNOWN
+#      and no lock is ever provably stale. We run `lsof -t`, whose stdout is PIDs
+#      only, judge on that, and keep stderr as a printed diagnostic - while still
+#      returning UNKNOWN whenever lsof could not actually run or complete. That
+#      leniency is scoped: a "can't stat() ... file system <mount>" warning whose
+#      mount CONTAINS the probe target means lsof could not enumerate the target's
+#      own filesystem, so its silence is not evidence and the answer is UNKNOWN.
+#   2. the retry window is followed by a bounded wait until the lock is old enough
+#      to judge. Upstream pairs a 30s staleness threshold with a 3x1s retry
+#      window, so a lock born DURING teardown (the exact case the port exists for:
+#      `treehouse return --force` killing a git process mid-operation) can never
+#      reach its own threshold and is always refused. We wait out the difference,
+#      capped, and then re-prove staleness on a fresh read.
+#   3. the lsof probe itself is bounded to $LSOF_PROBE_TIMEOUT_SECS seconds when a
+#      `timeout`/`gtimeout` binary exists. lsof stats the whole mount table and can
+#      block forever on a hung NFS/autofs mount - the very hosts this path targets -
+#      and upstream leaves that unbounded. A timed-out probe is UNKNOWN, never NONE,
+#      so the bound can only ever refuse a removal. Where no timeout binary exists
+#      (stock macOS) the probe runs unwrapped rather than degrading to a permanent
+#      UNKNOWN that would disable the removal path on that platform entirely.
+#
+# A crew process killed mid-git-operation can leave a
+# .git/worktrees/<wt>/index.lock (or, for a non-linked repo, .git/index.lock)
+# behind, so `treehouse return --force` fails with
+#   fatal: Unable to create '...index.lock': File exists
+# That lock is USUALLY TRANSIENT - the owning process is simply still exiting -
+# so the fix is patience, not rm: teardown_treehouse_return retries the return a
+# bounded number of times first, and the common case never gets any further.
+#
+# Removal is considered only for a lock that outlives the whole retry window, and
+# only when it is PROVABLY STALE, which needs BOTH proofs together:
+#   1. lsof reports no live process holding the lock file open AND none holding
+#      the worktree directory open (cwd or fd). A live git process keeps its own
+#      lock open for the whole operation, so "nothing holds it" means the file was
+#      abandoned by a process that has since exited - not that nobody ever held it.
+#      The worktree-directory half does not make this proof unsatisfiable, though
+#      it runs before `tmux kill-window`: `treehouse return --force` terminates the
+#      worktree's lingering processes - the crew agent and its pane shell, whose
+#      cwd is the worktree - BEFORE the git step that fails on the lock ("Terminate
+#      lingering processes and return a worktree", per `treehouse return --help`
+#      and the call site below). So by the time this probe runs, the pane is
+#      already gone and cannot register as a false holder. The dir half stays
+#      because it is what catches a process holding the WORKTREE without holding
+#      the lock file itself, which a lock-file-only probe would miss; and if
+#      treehouse's termination ever misses something, this refuses the removal,
+#      which is the fail-safe direction.
+#   2. the lock's mtime age is at least $STALE_WORKTREE_LOCK_AGE_SECS. A lock
+#      created moments ago may belong to a process lsof has not reflected yet.
+# If lsof is missing, errors, or otherwise cannot answer, that is UNKNOWN, not
+# stale: there is no fallback that removes a lock without lsof. Anything short of
+# both proofs leaves the lock untouched and reports the failure loudly, because
+# removing the lock of a live worktree corrupts its git index.
+#
+# A lock too YOUNG to judge is the one refusal worth waiting out, so the retries
+# are followed by a bounded wait of at most $STALE_WORKTREE_LOCK_AGE_SECS +
+# $STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS seconds, itself hard-capped at
+# $STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS so the bound is a property of this code
+# rather than of whoever set the threshold env var. The timer is never itself the
+# proof: when it ends, the age and the holder check are BOTH re-read and removal
+# happens only if worktree_lock_is_provably_stale passes on that fresh read.
+STALE_WORKTREE_LOCK_AGE_SECS=${FM_STALE_WORKTREE_LOCK_AGE_SECS:-30}
+# Floor for the above. The age proof must always be a real second proof, so the
+# threshold can be lowered but never to 0, which would switch it off entirely.
+STALE_WORKTREE_LOCK_AGE_MIN_SECS=1
+# Margin on top of the threshold so a lock that ages into judge-ability right at
+# the boundary is still judged; the wait can never exceed threshold + margin.
+STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS=5
+# Absolute ceiling on that wait. Teardown blocks in the foreground while it runs,
+# and firstmate must not sit in a long foreground operation with tasks in flight,
+# so no threshold setting can stretch the wait past this.
+STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS=60
+# Ceiling on a single lsof probe, applied only when timeout/gtimeout exists.
+LSOF_PROBE_TIMEOUT_SECS=5
+TREEHOUSE_RETURN_LOCK_RETRIES=${FM_TREEHOUSE_RETURN_LOCK_RETRIES:-3}
+TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS=${FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS:-1}
+# Tri-state answer to "does anything still hold this?". UNKNOWN is never stale.
+LOCK_HOLDER_LIVE=0
+LOCK_HOLDER_NONE=1
+LOCK_HOLDER_UNKNOWN=2
+# teardown_treehouse_return's distinct "a lock blocked the return" exit code.
+TEARDOWN_TREEHOUSE_LOCK_REFUSED=2
+# Why the last staleness check said no; set by worktree_lock_is_provably_stale.
+TEARDOWN_LOCK_STALE_REASON=
+# Set alongside it when the ONLY thing missing was age - the one refusal that
+# waiting can turn into a decision. Empty for every other refusal.
+TEARDOWN_LOCK_STALE_TOO_YOUNG=
+
+# Accepts "1", "0.5", ".5"; rejects junk. case globs, not [[ =~ ]], for bash 3.2.
+lock_wait_secs_is_valid() {
+  case "$1" in
+    ''|.|*[!0-9.]*|*.*.*) return 1 ;;
+  esac
+  return 0
+}
+if ! lock_wait_secs_is_valid "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"; then
+  echo "teardown: invalid lock retry wait '$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS'; using 1s" >&2
+  TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS=1
+fi
+case "$TREEHOUSE_RETURN_LOCK_RETRIES" in
+  ''|*[!0-9]*)
+    echo "teardown: invalid lock retry count '$TREEHOUSE_RETURN_LOCK_RETRIES'; using 3" >&2
+    TREEHOUSE_RETURN_LOCK_RETRIES=3
+    ;;
+esac
+# Half the safety invariant lives in this number, so junk or a negative value must
+# not reach the age comparison: `[ "$age" -lt abc ]` exits 2, which reads as "old
+# enough" and would skip the age proof entirely.
+case "$STALE_WORKTREE_LOCK_AGE_SECS" in
+  ''|*[!0-9]*)
+    echo "teardown: invalid stale lock age '$STALE_WORKTREE_LOCK_AGE_SECS'; using 30s" >&2
+    STALE_WORKTREE_LOCK_AGE_SECS=30
+    ;;
+esac
+# 0 passes the digits-only check above but is just as corrosive: `[ "$age" -lt 0 ]`
+# can never be true, so the age proof stops existing and removal would rest on the
+# lsof probe alone - a lock created microseconds ago, whose owner lsof has simply
+# not reflected yet, would be judged provably stale. No env value may reduce the
+# removal decision to a single proof, so floor it.
+if [ "$STALE_WORKTREE_LOCK_AGE_SECS" -lt "$STALE_WORKTREE_LOCK_AGE_MIN_SECS" ]; then
+  echo "teardown: stale lock age ${STALE_WORKTREE_LOCK_AGE_SECS}s would disable the age proof; using ${STALE_WORKTREE_LOCK_AGE_MIN_SECS}s" >&2
+  STALE_WORKTREE_LOCK_AGE_SECS=$STALE_WORKTREE_LOCK_AGE_MIN_SECS
+fi
+
+# git with the ambient repo-selecting variables cleared. `git -C <dir>` does NOT
+# override an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE: git obeys those and
+# ignores <dir>'s own repository. Every treehouse worktree shares one repo, so an
+# ambient GIT_DIR would resolve the shared PARENT repo's index.lock here - and
+# that path is what gets probed and, if judged stale, removed.
+git_without_ambient_repo_env() {
+  ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; git "$@" )
+}
+
+# Absolute path of the git index lock for a worktree or repo dir. Non-zero when
+# it cannot be resolved (dir missing, not a git worktree, or the resolved path is
+# not credibly this worktree's own index lock).
+#
+# The result is both the lsof probe target and the `rm -f` target, so it is
+# validated before it is handed back rather than trusted: the basename must be
+# index.lock, and it must live under the worktree itself or under that worktree's
+# common git dir (where a linked worktree's lock actually sits). Every other
+# removal in this file goes through validate_removal_target for the same reason -
+# an untrusted path must never reach rm.
+worktree_git_lock_path() {
+  local dir=$1 lock abs_dir abs_lock common
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  lock=$(git_without_ambient_repo_env -C "$dir" rev-parse --git-path index.lock 2>/dev/null) || return 1
+  [ -n "$lock" ] || return 1
+  abs_dir=$(removal_target_abs_path "$dir") || return 1
+  case "$lock" in
+    /*) abs_lock=$lock ;;
+    *)  abs_lock="$abs_dir/$lock" ;;
+  esac
+  [ "$(basename "$abs_lock")" = index.lock ] || return 1
+  if path_is_within "$abs_dir" "$abs_lock"; then
+    printf '%s\n' "$abs_lock"
+    return 0
+  fi
+  common=$(git_without_ambient_repo_env -C "$dir" rev-parse --git-common-dir 2>/dev/null) || common=""
+  [ -n "$common" ] || return 1
+  case "$common" in
+    /*) : ;;
+    *) common="$abs_dir/$common" ;;
+  esac
+  common=$(removal_target_abs_path "$common" 2>/dev/null) || return 1
+  path_is_within "$common" "$abs_lock" || return 1
+  printf '%s\n' "$abs_lock"
+}
+
+# The mountpoint named by an lsof "can't stat() <fstype> file system <path>"
+# warning, or nothing for any other line.
+lsof_warning_mount_path() {
+  case "$1" in
+    "lsof: WARNING: can't stat()"*" file system "*)
+      printf '%s\n' "${1#*" file system "}"
+      ;;
+  esac
+}
+
+# Is $path the same as, or inside, directory $ancestor? Pure string comparison:
+# a match it misses only leaves today's classification in place, while the
+# matches it makes are what push a doubtful probe to UNKNOWN.
+#
+# The prefix test itself is path_is_ancestor_of's; this only adds the two cases
+# that helper deliberately excludes - an exact match, and "/" as the ancestor -
+# so the file keeps ONE implementation of "is this path under that one".
+path_is_within() {
+  local ancestor=$1 path=$2
+  [ -n "$ancestor" ] && [ -n "$path" ] || return 1
+  case "$ancestor" in */) ancestor=${ancestor%/} ;; esac
+  # "/" trims to empty: every absolute path is inside the root.
+  if [ -z "$ancestor" ]; then
+    case "$path" in /*) return 0 ;; *) return 1 ;; esac
+  fi
+  [ "$path" = "$ancestor" ] || path_is_ancestor_of "$ancestor" "$path"
+}
+
+# Is everything lsof wrote to stderr while probing $2 a warning about some OTHER
+# filesystem? Those ("lsof: WARNING: can't stat() nsfs file system
+# /run/docker/netns/default" plus its indented continuation) are routine on any
+# host with docker, NFS or autofs mounts and say nothing about the target, so
+# they are noise. This is a whitelist, not a blacklist: ANY other diagnostic - a
+# status error on the target path, a usage error, a missing pwd entry - means
+# lsof did not answer for this path, and an unrecognized one is treated the same
+# way. The whitelist is scoped to OTHER filesystems: when the mount a warning
+# names contains the probe target, lsof could not walk the target's own
+# filesystem, so its silence about the target is not evidence either.
+lsof_diagnostics_are_benign() {
+  local err=$1 target=$2 line mount
+  [ -n "$err" ] || return 0
+  if printf '%s\n' "$err" | grep -qv -e '^lsof: WARNING:' -e '^[[:space:]]' -e '^$'; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    mount=$(lsof_warning_mount_path "$line")
+    [ -n "$mount" ] || continue
+    if path_is_within "$mount" "$target"; then
+      return 1
+    fi
+  done <<EOF
+$err
+EOF
+  return 0
+}
+
+# `timeout`/`gtimeout` binary to bound an lsof probe with, or nothing when the
+# host has neither (stock macOS).
+lsof_probe_timeout_bin() {
+  local bin
+  for bin in timeout gtimeout; do
+    if command -v "$bin" >/dev/null 2>&1; then
+      printf '%s\n' "$bin"
+      return 0
+    fi
+  done
+  # Explicit: without this the function would exit with the last `command -v`
+  # status, making the no-timeout-binary case (stock macOS - the platform the
+  # unwrapped probe exists to support) a FAILING function under set -eu.
+  return 0
+}
+
+# Does any live process hold $target open? LIVE / NONE / UNKNOWN.
+#
+# `lsof -t` puts PIDs on stdout and every diagnostic on stderr, so the answer is
+# read from stdout alone and stderr is printed but never counted as evidence -
+# that is what keeps a benign mount warning from masking a real "nothing holds
+# this". Empty stdout is NONE only when lsof actually RAN and finished: a missing
+# binary (caught by the caller's command -v guard), a non-1 exit, an unreadable
+# target, or any diagnostic outside the benign set is UNKNOWN, never no-holder.
+#
+# The probe is capped at $LSOF_PROBE_TIMEOUT_SECS seconds wherever a timeout
+# binary exists, so a hung mount cannot wedge teardown; a probe cut short that way
+# is UNKNOWN whatever it managed to print, so the cap can only refuse a removal.
+lsof_path_holder_state() {
+  local target=$1 pids errfile err status=0 timeout_bin
+  errfile=$(mktemp "${TMPDIR:-/tmp}/fm-teardown-lsof.XXXXXX" 2>/dev/null) || {
+    echo "teardown: could not stage the lsof check for $target, so it is no evidence" >&2
+    return "$LOCK_HOLDER_UNKNOWN"
+  }
+  timeout_bin=$(lsof_probe_timeout_bin)
+  if [ -n "$timeout_bin" ]; then
+    pids=$("$timeout_bin" "$LSOF_PROBE_TIMEOUT_SECS" lsof -t -- "$target" 2>"$errfile") || status=$?
+  else
+    pids=$(lsof -t -- "$target" 2>"$errfile") || status=$?
+  fi
+  err=$(cat "$errfile" 2>/dev/null || true)
+  rm -f "$errfile"
+  [ -z "$err" ] || printf '%s\n' "$err" | sed 's/^/teardown: lsof: /' >&2
+  if [ -n "$timeout_bin" ] && { [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; }; then
+    echo "teardown: lsof check for $target timed out after ${LSOF_PROBE_TIMEOUT_SECS}s, so it is no evidence" >&2
+    return "$LOCK_HOLDER_UNKNOWN"
+  fi
+  if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+    echo "teardown: lsof check for $target could not run (exit $status), so it is no evidence" >&2
+    return "$LOCK_HOLDER_UNKNOWN"
+  fi
+  if [ -n "$pids" ]; then
+    case "$pids" in
+      *[!0-9[:space:]]*)
+        echo "teardown: lsof check for $target returned unexpected output, so it is no evidence" >&2
+        return "$LOCK_HOLDER_UNKNOWN"
+        ;;
+    esac
+    return "$LOCK_HOLDER_LIVE"
+  fi
+  if [ "$status" -eq 0 ]; then
+    echo "teardown: lsof check for $target reported a match but named no process, so it is no evidence" >&2
+    return "$LOCK_HOLDER_UNKNOWN"
+  fi
+  if lsof_diagnostics_are_benign "$err" "$target"; then
+    return "$LOCK_HOLDER_NONE"
+  fi
+  echo "teardown: lsof check for $target did not complete cleanly, so it is no evidence" >&2
+  return "$LOCK_HOLDER_UNKNOWN"
+}
+
+# LIVE / NONE / UNKNOWN across the lock file AND the worktree dir. NONE only when
+# both probes positively answered "nothing holds this"; a missing lsof is UNKNOWN.
+worktree_lock_holder_state() {
+  local lock=$1 dir=$2 target state unknown=
+  command -v lsof >/dev/null 2>&1 || return "$LOCK_HOLDER_UNKNOWN"
+  for target in "$lock" "$dir"; do
+    [ -n "$target" ] || continue
+    state=$LOCK_HOLDER_LIVE
+    lsof_path_holder_state "$target" || state=$?
+    if [ "$state" -eq "$LOCK_HOLDER_LIVE" ]; then
+      return "$LOCK_HOLDER_LIVE"
+    fi
+    if [ "$state" -eq "$LOCK_HOLDER_UNKNOWN" ]; then
+      unknown=1
+    fi
+  done
+  if [ -n "$unknown" ]; then
+    return "$LOCK_HOLDER_UNKNOWN"
+  fi
+  return "$LOCK_HOLDER_NONE"
+}
+
+# Seconds since $lock was last modified; non-zero when that cannot be read.
+worktree_lock_age() {
+  local lock=$1 mtime now
+  mtime=$(fm_path_mtime "$lock") || return 1
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(date +%s) || return 1
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$(( now - mtime ))"
+}
+
+# The safety invariant itself: true ONLY when the lock exists, nothing holds it,
+# and it is old enough. Any doubt is a false, with the reason left in
+# TEARDOWN_LOCK_STALE_REASON for the caller's error message.
+worktree_lock_is_provably_stale() {
+  local lock=$1 dir=$2 state age
+  TEARDOWN_LOCK_STALE_REASON=
+  TEARDOWN_LOCK_STALE_TOO_YOUNG=
+  if [ -z "$lock" ] || [ ! -e "$lock" ]; then
+    TEARDOWN_LOCK_STALE_REASON="the lock file is no longer there"
+    return 1
+  fi
+  state=$LOCK_HOLDER_LIVE
+  worktree_lock_holder_state "$lock" "$dir" || state=$?
+  if [ "$state" -eq "$LOCK_HOLDER_LIVE" ]; then
+    TEARDOWN_LOCK_STALE_REASON="a live process still holds the lock or the worktree"
+    return 1
+  fi
+  if [ "$state" -eq "$LOCK_HOLDER_UNKNOWN" ]; then
+    TEARDOWN_LOCK_STALE_REASON="lsof cannot answer whether a process still holds it (missing or errored), so staleness is unprovable"
+    return 1
+  fi
+  if ! age=$(worktree_lock_age "$lock"); then
+    TEARDOWN_LOCK_STALE_REASON="its mtime could not be read"
+    return 1
+  fi
+  if [ "$age" -lt "$STALE_WORKTREE_LOCK_AGE_SECS" ]; then
+    TEARDOWN_LOCK_STALE_REASON="it is only ${age}s old (staleness threshold ${STALE_WORKTREE_LOCK_AGE_SECS}s)"
+    TEARDOWN_LOCK_STALE_TOO_YOUNG=1
+    return 1
+  fi
+  return 0
+}
+
+# Wait, BOUNDED, for a lock that is merely too young to be judged. The cap is
+# $STALE_WORKTREE_LOCK_AGE_SECS + $STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS seconds,
+# itself clamped to $STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS so no threshold setting
+# can stretch this foreground wait, and the loop can never run past it; a lock born
+# during teardown (age ~0s) otherwise outlives the short retry window without ever
+# becoming judge-able.
+# Returns as soon as the lock is old enough, vanishes, or the cap is reached -
+# and NONE of those outcomes is proof of anything. The caller must re-run
+# worktree_lock_is_provably_stale on a fresh read before removing anything.
+worktree_lock_wait_until_judgeable() {
+  local lock=$1 label=$2 cap deadline now age
+  cap=$(( STALE_WORKTREE_LOCK_AGE_SECS + STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS ))
+  [ "$cap" -le "$STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS" ] || cap=$STALE_WORKTREE_LOCK_WAIT_CAP_MAX_SECS
+  # Once the cap bites, waiting can become arithmetically futile: with a threshold
+  # above the cap, the lock cannot reach judge-ability inside the wait no matter
+  # what, so sitting here would be a guaranteed-useless foreground stall in the
+  # one operation AGENTS.md section 8 says must not block. Refuse up front instead.
+  age=$(worktree_lock_age "$lock") || return 1
+  if [ "$(( age + cap ))" -lt "$STALE_WORKTREE_LOCK_AGE_SECS" ]; then
+    echo "teardown: $label index.lock $lock is ${age}s old and the bounded ${cap}s wait cannot reach the ${STALE_WORKTREE_LOCK_AGE_SECS}s staleness threshold; refusing now rather than stalling" >&2
+    return 1
+  fi
+  now=$(date +%s) || return 1
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  deadline=$(( now + cap ))
+  echo "teardown: $label index.lock $lock is too young to judge; waiting up to ${cap}s for it to clear or age past the ${STALE_WORKTREE_LOCK_AGE_SECS}s staleness threshold" >&2
+  while [ -e "$lock" ]; do
+    age=$(worktree_lock_age "$lock") || return 1
+    [ "$age" -lt "$STALE_WORKTREE_LOCK_AGE_SECS" ] || return 0
+    now=$(date +%s) || return 1
+    case "$now" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$now" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+  return 0
+}
+
+# True when treehouse/git output carries the transient index.lock signature. Any
+# other return failure must not enter the retry-then-remove path at all.
+treehouse_return_is_index_lock_error() {
+  printf '%s\n' "$1" | grep -Eq "Unable to create ['\"]?[^']*index\.lock['\"]?: File exists"
+}
+
+# Return a worktree or secondmate home via `treehouse return --force`, tolerating
+# a transient or provably-stale git index.lock. Exit codes:
+#   0                                 returned
+#   $TEARDOWN_TREEHOUSE_LOCK_REFUSED  a lock outlived the retries and the bounded
+#                                     wait and was not proved stale, or was proved
+#                                     stale but could not be removed; either way it
+#                                     is LEFT IN PLACE and the return did not happen
+#   1                                 any other failure
+teardown_treehouse_return() {
+  local dir=$1 cd_dir=$2 label=$3 out lock attempt=0 remove=0
+
+  # Capture both streams: non-lock failures stay visible, and the lock signature
+  # can be matched even when the lock file itself races away mid-check.
+  if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+    [ -z "$out" ] || printf '%s\n' "$out"
+    return 0
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out" >&2
+  treehouse_return_is_index_lock_error "$out" || return 1
+
+  lock=$(worktree_git_lock_path "$dir") || lock=""
+  while [ "$attempt" -lt "$TREEHOUSE_RETURN_LOCK_RETRIES" ]; do
+    attempt=$(( attempt + 1 ))
+    echo "teardown: $label return hit a git index.lock (${lock:-index.lock}); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/$TREEHOUSE_RETURN_LOCK_RETRIES) - the owning process may simply be exiting" >&2
+    sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
+    if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+      [ -z "$out" ] || printf '%s\n' "$out"
+      echo "teardown: $label return succeeded on retry; the index.lock cleared on its own" >&2
+      return 0
+    fi
+    [ -z "$out" ] || printf '%s\n' "$out" >&2
+    if ! treehouse_return_is_index_lock_error "$out"; then
+      echo "teardown: $label return failed with a non-lock error after a retry; leaving any lock alone" >&2
+      return 1
+    fi
+  done
+
+  # Patience exhausted. Re-resolve the lock: it may have appeared, moved, or
+  # cleared while we waited.
+  lock=$(worktree_git_lock_path "$dir") || lock=""
+  if [ -z "$lock" ] || [ ! -e "$lock" ]; then
+    echo "ERROR: teardown: $label return kept failing on the index.lock signature across $TREEHOUSE_RETURN_LOCK_RETRIES retries although no lock file is present; $dir was NOT returned" >&2
+    return 1
+  fi
+
+  # A lock too young to judge is waited out (bounded) and then RE-PROVED from a
+  # fresh read - the timer expiring is never itself the proof.
+  remove=0
+  if worktree_lock_is_provably_stale "$lock" "$dir"; then
+    remove=1
+  elif [ -n "$TEARDOWN_LOCK_STALE_TOO_YOUNG" ]; then
+    worktree_lock_wait_until_judgeable "$lock" "$label" || true
+    if [ -e "$lock" ] && worktree_lock_is_provably_stale "$lock" "$dir"; then
+      remove=1
+    fi
+  fi
+
+  if [ "$remove" -eq 1 ]; then
+    if ! rm -f "$lock" 2>/dev/null || [ -e "$lock" ]; then
+      echo "ERROR: teardown: git index.lock $lock is provably stale but could not be removed." >&2
+      echo "ERROR: teardown: the lock is still in place and $label $dir was NOT returned. Clear the lock by hand, then rerun teardown." >&2
+      return "$TEARDOWN_TREEHOUSE_LOCK_REFUSED"
+    fi
+    echo "teardown: removed provably-stale git index.lock $lock (no live holder, age >= ${STALE_WORKTREE_LOCK_AGE_SECS}s); retrying $label return" >&2
+  elif [ ! -e "$lock" ]; then
+    echo "teardown: git index.lock $lock cleared on its own before any removal was needed; retrying $label return" >&2
+  else
+    echo "ERROR: teardown: refusing to remove git index.lock $lock: $TEARDOWN_LOCK_STALE_REASON." >&2
+    echo "ERROR: teardown: the lock was left in place and $label $dir was NOT returned. Confirm no git process is running against that worktree, clear the lock, then rerun teardown." >&2
+    return "$TEARDOWN_TREEHOUSE_LOCK_REFUSED"
+  fi
+
+  if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+    [ -z "$out" ] || printf '%s\n' "$out"
+    echo "teardown: $label return succeeded after stale-lock cleanup" >&2
+    return 0
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out" >&2
+  echo "ERROR: teardown: $label return still failing after clearing the index.lock; $dir was NOT returned" >&2
+  return 1
+}
+# FM-LOCK-RECOVERY-END
+
 validate_firstmate_home_for_removal() {
   local home=$1 label=$2 expected_id=${3:-} abs_home_path marker_id conflict child_id child_home
   [ -n "$home" ] || return 0
@@ -453,7 +964,7 @@ remove_firstmate_home() {
       echo "error: treehouse command not found; cannot return $label $abs_home_path" >&2
       return 1
     }
-    ( cd "$FM_ROOT" && treehouse return --force "$abs_home_path" ) || {
+    teardown_treehouse_return "$abs_home_path" "$FM_ROOT" "$label" || {
       echo "error: treehouse return failed for $label $abs_home_path; lease may still be held" >&2
       return 1
     }
@@ -613,14 +1124,13 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-# Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+  # Note the task branch while the worktree is still ours to read. The DROP itself
+  # happens after the return, not here: dropping it here needs `git checkout
+  # --detach`, which writes the index, so the very index.lock this teardown exists
+  # to recover from also blocked the drop - and every lock-rescued teardown then
+  # leaked its fm/<id> ref into the shared pooled repo.
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-  if [ "$branch" != "HEAD" ]; then
-    if git -C "$WT" checkout --detach -q 2>/dev/null; then
-      git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
-    fi
-  fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   # Reap a watcher that ran as THIS worktree's own firstmate home. A self-dev home
@@ -634,12 +1144,31 @@ if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   pkill -f "$WT/bin/fm-watch.sh" 2>/dev/null || true
   # Kills remaining processes in the worktree (including the agent), resets, returns
   # to pool. treehouse resolves the pool from the working directory, so run it from
-  # the project. Guarded against set -eu (finding F11): a return failure (lingering
-  # run processes, a release race) used to abort teardown BEFORE kill-window and
+  # the project. teardown_treehouse_return absorbs the transient index.lock a killed
+  # crew git process leaves behind, and removes that lock only when it is provably
+  # stale (see the FM-LOCK-RECOVERY block).
+  # Guarded against set -eu (finding F11): a return failure (lingering run
+  # processes, a release race) used to abort teardown BEFORE kill-window and
   # meta-clear, stranding a husk window and a ghost meta - warn and continue, the
-  # same pattern as the fleet-sync call below.
-  if ! ( cd "$PROJ" && treehouse return --force "$WT" ); then
+  # same pattern as the fleet-sync call below. The lock-refused case keeps that
+  # husk cleanup but is surfaced as a loud error, not a soft warning: the worktree
+  # is still checked out and still locked, and a human has to resolve it.
+  return_rc=0
+  teardown_treehouse_return "$WT" "$PROJ" "worktree" || return_rc=$?
+  if [ "$return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
+    echo "ERROR: teardown: worktree $WT was NOT returned - its git index.lock could not be safely recovered (see above). Continuing so the window and meta are still cleared; rerun 'treehouse return --force $WT' once the lock is resolved." >&2
+  elif [ "$return_rc" -ne 0 ]; then
     echo "warning: treehouse return --force failed for $WT (rerun it manually); continuing teardown so the window and meta are still cleared" >&2
+  fi
+  # Best-effort: drop the local task branch so the shared repo does not accumulate
+  # refs - but ONLY once the worktree was actually returned. The return releases
+  # the worktree, so the branch is no longer checked out anywhere and `branch -D`
+  # against the project repo cannot be blocked by any worktree index lock. When the
+  # return did NOT happen (the lock-refused path, or the F11 warn-and-continue
+  # path) the branch is deliberately left alone: its work is still sitting checked
+  # out in that worktree, and dropping the ref would strand it.
+  if [ "$return_rc" -eq 0 ] && [ -n "$branch" ] && [ "$branch" != HEAD ]; then
+    git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
   fi
 fi
 

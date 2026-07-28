@@ -56,7 +56,11 @@ make_case() {
   # run; the ALLOW cases need them so the script can complete cleanly.
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
-# `treehouse return --force <wt>`: succeed silently.
+# `treehouse return --force <wt>`: succeed silently, resetting the worktree to the
+# pool's detached default branch as the real return does - that is what frees the
+# task branch ref for teardown to drop from the project repo afterwards.
+wt=${!#}
+[ -d "$wt" ] && git -C "$wt" checkout --detach -q 2>/dev/null
 exit 0
 SH
   cat > "$fakebin/tmux" <<'SH'
@@ -610,7 +614,28 @@ SH
   grep -q "teardown task-x1 complete" "$case_dir/stdout" || fail "return-fails: completion line missing"
   grep -qi "warning: treehouse return" "$case_dir/stderr" || fail "return-fails: no warning about the failed return"
   assert_absent "$case_dir/state/task-x1.meta" "return-fails: stale meta left behind"
+  git -C "$case_dir/project" rev-parse --verify -q refs/heads/fm/task-x1 >/dev/null \
+    || fail "return-fails: the task branch must be left alone - it is still checked out in the unreturned worktree"
   pass "a failed treehouse return warns and still completes window-kill + meta-clear"
+}
+
+# The counterpart: after a SUCCESSFUL return the task branch is dropped from the
+# project repo, so the shared pool repo does not accumulate one ref per task.
+test_task_branch_dropped_after_successful_return() {
+  local case_dir rc
+  case_dir=$(make_case branch-drop)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "unpushed work"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "branch-drop: teardown should complete"
+  ! git -C "$case_dir/project" rev-parse --verify -q refs/heads/fm/task-x1 >/dev/null \
+    || fail "branch-drop: the task branch leaked into the project repo after a successful return"
+  pass "the task branch is dropped from the project repo after a successful return"
 }
 
 # Version-tolerance regression: the squash-merge-then-delete-branch case must tear
@@ -753,6 +778,7 @@ test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_treehouse_return_failure_still_completes_teardown
+test_task_branch_dropped_after_successful_return
 test_squash_merged_branch_deleted_allows
 test_merged_pr_with_later_local_commit_refuses
 test_pr_check_does_not_refresh_stale_pr_head
