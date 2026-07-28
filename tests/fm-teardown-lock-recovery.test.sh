@@ -248,16 +248,17 @@ test_provably_stale_only_when_both_proofs_hold() {
   pass "provably-stale requires BOTH no-holder AND old mtime; any doubt is a refusal"
 }
 
-# The age proof is half the invariant, so a junk or negative threshold must not
-# be able to skip it: `[ "$age" -lt abc ]` exits 2, which the `if` reads as "old
-# enough" and would wave a fresh lock through as stale.
+# The age proof is half the invariant, so no threshold value may skip it. A junk or
+# negative one makes `[ "$age" -lt abc ]` exit 2, which the `if` reads as "old
+# enough"; a 0 is below every age there is, which disables the proof outright and
+# leaves removal resting on the lsof probe alone. Both must still refuse a fresh lock.
 test_junk_staleness_threshold_cannot_skip_the_age_proof() {
   local fresh rc bad fakebin
   fresh=$(make_lock threshold-fresh fresh)
   fakebin="$TMP_ROOT/unit-fakebin"
   mkdir -p "$fakebin"
   make_lsof_stub "$fakebin"
-  for bad in abc -1 30s ' '; do
+  for bad in abc -1 30s ' ' 0; do
     rc=0
     (
       export PATH="$fakebin:$PATH" FM_LSOF_MODE=none \
@@ -272,7 +273,7 @@ test_junk_staleness_threshold_cannot_skip_the_age_proof() {
     [ "$rc" -ne 0 ] \
       || fail "staleness threshold '$bad' let a fresh lock pass the age proof"
   done
-  pass "an invalid staleness threshold falls back to the default instead of skipping the age proof"
+  pass "no staleness threshold value - junk, negative, or zero - can skip the age proof"
 }
 
 # Teardown blocks in the foreground for this wait, so its ceiling must belong to
@@ -414,6 +415,10 @@ if [ "$fail" -eq 1 ]; then
   echo "treehouse: worktree return failed" >&2
   exit 1
 fi
+# A real return resets the worktree back to the pool's detached default branch,
+# which is what frees the task branch ref for teardown to drop afterwards.
+wt=${!#}
+[ -d "$wt" ] && git -C "$wt" checkout --detach -q 2>/dev/null
 exit 0
 SH
   cat > "$fakebin/tmux" <<'SH'
@@ -451,6 +456,17 @@ make_case() {
   touch "$case_dir/state/.last-watcher-beat"
 
   printf '%s\n' "$case_dir"
+}
+
+# The task branch is dropped from the PROJECT repo, and only after a successful
+# return - so a lock-refused teardown must leave it, and a recovered one must not.
+assert_task_branch() {  # <case_dir> <present|gone> <message>
+  local case_dir=$1 want=$2 msg=$3 rc=0
+  git -C "$case_dir/project" rev-parse --verify -q refs/heads/fm/task-x1 >/dev/null || rc=$?
+  case "$want" in
+    present) [ "$rc" -eq 0 ] || fail "$msg" ;;
+    gone)    [ "$rc" -ne 0 ] || fail "$msg" ;;
+  esac
 }
 
 # The worktree's real git index.lock path, resolved exactly as the script does.
@@ -508,6 +524,8 @@ test_live_held_lock_is_never_removed() {
   assert_contains "$stderr" "$lock" "live-held: the error must name the lock it left in place"
   assert_not_contains "$stderr" "removed provably-stale" \
     "live-held: the force-remove branch must never be reported"
+  assert_task_branch "$case_dir" present \
+    "live-held: the task branch must survive a refused return - the work is still checked out there"
   # F11 husk cleanup still runs so no ghost window/meta is stranded.
   assert_absent "$case_dir/state/task-x1.meta" "live-held: stale meta left behind"
   expect_code 0 "$rc" "live-held: teardown still completes its window/meta cleanup"
@@ -535,6 +553,10 @@ test_provably_stale_lock_is_removed_and_return_retried() {
   assert_contains "$stderr" "succeeded after stale-lock cleanup" \
     "provably-stale: the return must be retried after the removal"
   assert_not_contains "$stderr" "ERROR:" "provably-stale: a recovered return must not report an error"
+  # The ref accounting the recovery must not cost: a teardown the lock recovery
+  # rescued still drops the task branch, instead of leaking it into the pool repo.
+  assert_task_branch "$case_dir" gone \
+    "provably-stale: a recovered teardown must still drop the task branch"
   grep -q "teardown task-x1 complete" "$case_dir/stdout" \
     || fail "provably-stale: completion line missing"
   pass "B: a lock with no holder and an old mtime is removed and the return succeeds"

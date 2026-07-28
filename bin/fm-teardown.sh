@@ -486,6 +486,10 @@ safe_rm_rf_child_worktree() {
 # proof: when it ends, the age and the holder check are BOTH re-read and removal
 # happens only if worktree_lock_is_provably_stale passes on that fresh read.
 STALE_WORKTREE_LOCK_AGE_SECS=${FM_STALE_WORKTREE_LOCK_AGE_SECS:-30}
+# Floor under that threshold. A threshold of 0 is not a fast setting, it is the
+# age proof switched off: no age can be below it, so removal would rest on the
+# lsof probe alone - exactly the single-proof state this block forbids.
+STALE_WORKTREE_LOCK_AGE_MIN_SECS=1
 # Margin on top of the threshold so a lock that ages into judge-ability right at
 # the boundary is still judged; the wait can never exceed threshold + margin.
 STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS=5
@@ -526,15 +530,21 @@ case "$TREEHOUSE_RETURN_LOCK_RETRIES" in
     TREEHOUSE_RETURN_LOCK_RETRIES=3
     ;;
 esac
-# Half the safety invariant lives in this number, so junk or a negative value must
-# not reach the age comparison: `[ "$age" -lt abc ]` exits 2, which reads as "old
-# enough" and would skip the age proof entirely.
+# Half the safety invariant lives in this number, so no value may reach the age
+# comparison in a form that skips the proof: junk or a negative makes
+# `[ "$age" -lt abc ]` exit 2, which reads as "old enough", and a zero (or any
+# sub-floor value) is never above an age at all, so both would leave removal
+# resting on the lsof probe alone.
 case "$STALE_WORKTREE_LOCK_AGE_SECS" in
   ''|*[!0-9]*)
     echo "teardown: invalid stale lock age '$STALE_WORKTREE_LOCK_AGE_SECS'; using 30s" >&2
     STALE_WORKTREE_LOCK_AGE_SECS=30
     ;;
 esac
+if [ "$STALE_WORKTREE_LOCK_AGE_SECS" -lt "$STALE_WORKTREE_LOCK_AGE_MIN_SECS" ]; then
+  echo "teardown: stale lock age ${STALE_WORKTREE_LOCK_AGE_SECS}s would disable the age proof; using ${STALE_WORKTREE_LOCK_AGE_MIN_SECS}s" >&2
+  STALE_WORKTREE_LOCK_AGE_SECS=$STALE_WORKTREE_LOCK_AGE_MIN_SECS
+fi
 
 # Absolute path git reports for a `rev-parse` spec inside $dir, resolved with the
 # ambient repo environment scrubbed. `-C` does NOT override an inherited GIT_DIR,
@@ -1091,14 +1101,10 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-# Best-effort: drop the local task branch so the shared repo does not accumulate refs.
+# Note the local task branch so it can be dropped after the return below, keeping
+# the shared repo from accumulating refs. Detached or unnamed HEAD has nothing to drop.
 if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-  if [ "$branch" != "HEAD" ]; then
-    if git -C "$WT" checkout --detach -q 2>/dev/null; then
-      git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
-    fi
-  fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   # Reap a watcher that ran as THIS worktree's own firstmate home. A self-dev home
@@ -1127,6 +1133,16 @@ if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     echo "ERROR: teardown: worktree $WT was NOT returned - its git index.lock could not be safely recovered (see above). Continuing so the window and meta are still cleared; rerun 'treehouse return --force $WT' once the lock is resolved." >&2
   elif [ "$return_rc" -ne 0 ]; then
     echo "warning: treehouse return --force failed for $WT (rerun it manually); continuing teardown so the window and meta are still cleared" >&2
+  fi
+  # Drop the task branch only after a SUCCESSFUL return, and from the project repo:
+  # deleting it needs no index write there, so it cannot be blocked by the very
+  # index.lock this teardown just recovered from - unlike the worktree-side detach
+  # this replaces, which failed under a lock and leaked the ref every time. When the
+  # return did not succeed (lock-refused, or the warn-and-continue path above) the
+  # branch is deliberately left alone: it is still checked out in that worktree and
+  # still holds the work. Best-effort either way.
+  if [ "$return_rc" -eq 0 ] && [ "$branch" != HEAD ] && [ -n "$branch" ]; then
+    git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
   fi
 fi
 
