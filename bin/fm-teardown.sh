@@ -536,20 +536,52 @@ case "$STALE_WORKTREE_LOCK_AGE_SECS" in
     ;;
 esac
 
-# Absolute path of the git index lock for a worktree or repo dir. Non-zero when
-# it cannot be resolved (dir missing, or not a git worktree at all).
-worktree_git_lock_path() {
-  local dir=$1 lock abs_dir
-  [ -n "$dir" ] && [ -d "$dir" ] || return 1
-  lock=$(git -C "$dir" rev-parse --git-path index.lock 2>/dev/null) || return 1
-  [ -n "$lock" ] || return 1
-  case "$lock" in
-    /*) printf '%s\n' "$lock" ;;
+# Absolute path git reports for a `rev-parse` spec inside $dir, resolved with the
+# ambient repo environment scrubbed. `-C` does NOT override an inherited GIT_DIR,
+# GIT_WORK_TREE or GIT_INDEX_FILE: with one of those set, git answers for that
+# other repository instead, and the answer would become both the lsof probe target
+# and the rm target. Non-zero when git or the path resolution cannot answer.
+worktree_git_rev_parse_path() {
+  local dir=$1 out abs_dir
+  shift
+  out=$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; git -C "$dir" rev-parse "$@" 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  case "$out" in
+    /*) removal_target_abs_path "$out" 2>/dev/null || return 1 ;;
     *)
-      abs_dir=$(removal_target_abs_path "$dir") || return 1
-      printf '%s/%s\n' "$abs_dir" "$lock"
+      abs_dir=$(removal_target_abs_path "$dir" 2>/dev/null) || return 1
+      removal_target_abs_path "$abs_dir/$out" 2>/dev/null || return 1
       ;;
   esac
+}
+
+# Absolute path of the git index lock for a worktree or repo dir. Non-zero when
+# it cannot be resolved (dir missing, not a git worktree at all, or git named a
+# path that is not this dir's own index.lock).
+#
+# The result is the only thing the recovery ever probes or removes, so it is
+# validated here rather than at the removal: the basename must be index.lock, and
+# the file must live under the dir itself, its git dir, or its common git dir. A
+# path failing either check is unresolvable - the caller then refuses instead of
+# touching anything.
+worktree_git_lock_path() {
+  local dir=$1 lock abs_dir owner spec
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  lock=$(worktree_git_rev_parse_path "$dir" --git-path index.lock) || return 1
+  [ "${lock##*/}" = "index.lock" ] || return 1
+  abs_dir=$(removal_target_abs_path "$dir" 2>/dev/null) || return 1
+  if path_is_within "$abs_dir" "$lock"; then
+    printf '%s\n' "$lock"
+    return 0
+  fi
+  for spec in --git-dir --git-common-dir; do
+    owner=$(worktree_git_rev_parse_path "$dir" "$spec") || continue
+    if path_is_within "$owner" "$lock"; then
+      printf '%s\n' "$lock"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # The mountpoint named by an lsof "can't stat() <fstype> file system <path>"
@@ -615,6 +647,9 @@ lsof_probe_timeout_bin() {
       return 0
     fi
   done
+  # "No timeout binary" is a normal answer, not a failure. Stated explicitly so a
+  # caller under set -eu never depends on the exit status of a trailing loop.
+  return 0
 }
 
 # Does any live process hold $target open? LIVE / NONE / UNKNOWN.

@@ -308,6 +308,86 @@ test_index_lock_signature_matches_git_only() {
   pass "only the git index.lock 'File exists' signature enters the retry path"
 }
 
+# The resolved path is the ONLY thing the recovery probes and removes, so an
+# ambient GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE - which `git -C` does not override -
+# must not be able to point it at some other repository's index.lock.
+test_lock_path_ignores_ambient_git_env() {
+  local base wt_lock poisoned
+  base="$TMP_ROOT/git-env"
+  rm -rf "$base"
+  mkdir -p "$base"
+  git init -q "$base/main"
+  git -C "$base/main" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+  git -C "$base/main" worktree add -q "$base/wt"
+  git init -q "$base/other"
+
+  wt_lock=$(worktree_git_lock_path "$base/wt") \
+    || fail "git env: the worktree's own index.lock path must resolve"
+  poisoned=$(
+    GIT_DIR="$base/other/.git" GIT_WORK_TREE="$base/other" \
+    GIT_INDEX_FILE="$base/other/.git/index" \
+      worktree_git_lock_path "$base/wt"
+  ) || fail "git env: resolution must still succeed with a foreign git env set"
+
+  [ "$poisoned" = "$wt_lock" ] \
+    || fail "git env: an inherited GIT_DIR must not redirect the lock path to another repo"
+  assert_not_contains "$poisoned" "/other/" \
+    "git env: the resolved lock must belong to the worktree, never the ambient repo"
+  pass "the lock path is resolved with the ambient git env scrubbed"
+}
+
+# Defense in depth behind that scrub: whatever git names is validated before it can
+# become a probe or rm target, and a path that fails is unresolvable, not removable.
+test_lock_path_refuses_a_path_it_cannot_vouch_for() {
+  local base out
+  base="$TMP_ROOT/git-path-validation"
+  rm -rf "$base"
+  mkdir -p "$base/fakebin" "$base/elsewhere"
+  git init -q "$base/repo"
+
+  git_stub() {  # <path rev-parse should name for --git-path>
+    cat > "$base/fakebin/git" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  *--git-path*) printf '%s\n' '$1' ;;
+  *--git-dir*|*--git-common-dir*) printf '%s\n' '$base/repo/.git' ;;
+esac
+SH
+    chmod +x "$base/fakebin/git"
+  }
+
+  git_stub "$base/elsewhere/index.lock"
+  out=$(PATH="$base/fakebin:$PATH" worktree_git_lock_path "$base/repo") \
+    && fail "validation: a lock outside the worktree and its git dir must be refused"
+  [ -z "$out" ] || fail "validation: a refused resolution must print nothing"
+
+  git_stub "$base/repo/.git/config"
+  out=$(PATH="$base/fakebin:$PATH" worktree_git_lock_path "$base/repo") \
+    && fail "validation: a path that is not an index.lock must be refused"
+  [ -z "$out" ] || fail "validation: a refused resolution must print nothing"
+
+  git_stub "$base/repo/.git/index.lock"
+  out=$(PATH="$base/fakebin:$PATH" worktree_git_lock_path "$base/repo") \
+    || fail "validation: the repo's own index.lock must still resolve"
+  [ "$out" = "$base/repo/.git/index.lock" ] \
+    || fail "validation: a vouched-for lock must be returned unchanged"
+  pass "a lock path git cannot be vouched for is unresolvable, never a removal target"
+}
+
+# On a host with neither timeout nor gtimeout the probe helper must still succeed -
+# under set -eu a non-zero return would abort teardown instead of just skipping the
+# cap. Pins that contract so it cannot be lost to a later rewrite of the lookup.
+test_timeout_probe_is_not_a_failure_without_a_timeout_binary() {
+  local empty out rc=0
+  empty="$TMP_ROOT/no-timeout-bin"
+  rm -rf "$empty"
+  mkdir -p "$empty"
+  out=$(PATH="$empty" lsof_probe_timeout_bin) || rc=$?
+  expect_code 0 "$rc" "timeout probe: a host without timeout/gtimeout must not be a failure"
+  [ -z "$out" ] || fail "timeout probe: no binary means no timeout wrapper"
+  pass "the timeout probe succeeds quietly when the host has no timeout binary"
+}
+
 # --- end-to-end sandbox ------------------------------------------------------
 
 # Stubs every end-to-end case needs: a scriptable treehouse, an inert tmux, and
@@ -763,4 +843,7 @@ test_waited_out_lock_is_reproved_not_assumed
 test_failed_removal_is_not_reported_as_a_removal
 test_secondmate_home_return_recovers_a_stale_lock
 test_secondmate_home_return_refusal_aborts_teardown
+test_lock_path_ignores_ambient_git_env
+test_lock_path_refuses_a_path_it_cannot_vouch_for
+test_timeout_probe_is_not_a_failure_without_a_timeout_binary
 test_non_lock_failure_does_not_enter_lock_recovery
