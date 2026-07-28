@@ -82,6 +82,7 @@ tests/fm-secondmate-sync.test.sh          # local-HEAD secondmate sync, no-fetch
 tests/fm-secondmate-lifecycle-e2e.test.sh # persistent secondmate routing, seeding, backlog handoff, spawn, recovery, teardown, and FM_HOME flow tests
 tests/fm-secondmate-safety.test.sh        # secondmate home safety, idle charter, handoff validation, and teardown boundary tests
 tests/fm-teardown.test.sh                 # fm-teardown.sh landed-work safety and reminder checks: fork-remote allow, squash/content landings, old-gh/old-git version tolerance (no headRefOid, no merge-tree --write-tree), dirty and unlanded refusals, PR-head metadata, tasks-axi reminder, --force override
+tests/fm-teardown-lock-recovery.test.sh   # fm-teardown.sh git index.lock recovery: live-held and unprovable (lsof missing/errored) locks are never removed, a provably-stale lock is removed and the return retried, and a transient lock recovers on retry without ever reaching the force-remove branch
 tests/fm-crew-state.test.sh               # fm-crew-state.sh current-state reconciliation: run-step authority including closed panes, stale needs-decision/blocked superseded by a resumed run, genuine-parked, cross-branch attribution, pane/status-log fallback, scout skip, torn-down/missing-meta graceful
 [ "$(readlink CLAUDE.md)" = "AGENTS.md" ]
 [ "$(readlink .claude/skills)" = "../.agents/skills" ]
