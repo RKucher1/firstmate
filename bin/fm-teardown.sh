@@ -497,6 +497,9 @@ safe_rm_rf_child_worktree() {
 # proof: when it ends, the age and the holder check are BOTH re-read and removal
 # happens only if worktree_lock_is_provably_stale passes on that fresh read.
 STALE_WORKTREE_LOCK_AGE_SECS=${FM_STALE_WORKTREE_LOCK_AGE_SECS:-30}
+# Floor for the above. The age proof must always be a real second proof, so the
+# threshold can be lowered but never to 0, which would switch it off entirely.
+STALE_WORKTREE_LOCK_AGE_MIN_SECS=1
 # Margin on top of the threshold so a lock that ages into judge-ability right at
 # the boundary is still judged; the wait can never exceed threshold + margin.
 STALE_WORKTREE_LOCK_WAIT_MARGIN_SECS=5
@@ -546,6 +549,15 @@ case "$STALE_WORKTREE_LOCK_AGE_SECS" in
     STALE_WORKTREE_LOCK_AGE_SECS=30
     ;;
 esac
+# 0 passes the digits-only check above but is just as corrosive: `[ "$age" -lt 0 ]`
+# can never be true, so the age proof stops existing and removal would rest on the
+# lsof probe alone - a lock created microseconds ago, whose owner lsof has simply
+# not reflected yet, would be judged provably stale. No env value may reduce the
+# removal decision to a single proof, so floor it.
+if [ "$STALE_WORKTREE_LOCK_AGE_SECS" -lt "$STALE_WORKTREE_LOCK_AGE_MIN_SECS" ]; then
+  echo "teardown: stale lock age ${STALE_WORKTREE_LOCK_AGE_SECS}s would disable the age proof; using ${STALE_WORKTREE_LOCK_AGE_MIN_SECS}s" >&2
+  STALE_WORKTREE_LOCK_AGE_SECS=$STALE_WORKTREE_LOCK_AGE_MIN_SECS
+fi
 
 # git with the ambient repo-selecting variables cleared. `git -C <dir>` does NOT
 # override an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE: git obeys those and

@@ -278,6 +278,33 @@ test_junk_staleness_threshold_cannot_skip_the_age_proof() {
   pass "an invalid staleness threshold falls back to the default instead of skipping the age proof"
 }
 
+# 0 is the sharp threshold value: it is numerically valid, so a digits-only check
+# waves it through, and then `[ "$age" -lt 0 ]` can never be true - the age proof
+# silently stops existing and removal rests on the lsof probe alone, so a lock
+# created microseconds ago (whose owner lsof has simply not reflected yet) would be
+# judged provably stale. Asserted on the EFFECTIVE threshold rather than by aging a
+# lock, because a floored threshold of 1s is by definition something a "fresh" lock
+# ages past within a second - a timing-dependent assertion here would be flaky.
+test_zero_threshold_is_floored_not_accepted() {
+  local effective
+  effective=$(
+    (
+      export FM_STATE_OVERRIDE="$TMP_ROOT/lib-state" FM_STALE_WORKTREE_LOCK_AGE_SECS=0
+      # shellcheck source=bin/fm-wake-lib.sh
+      . "$ROOT/bin/fm-wake-lib.sh"
+      # shellcheck source=/dev/null
+      . "$LOCK_LIB"
+      printf '%s\n' "$STALE_WORKTREE_LOCK_AGE_SECS"
+    ) 2>/dev/null
+  )
+  case "$effective" in
+    ''|*[!0-9]*) fail "zero threshold: effective staleness threshold is not a number ('$effective')" ;;
+  esac
+  [ "$effective" -ge 1 ] \
+    || fail "zero threshold: FM_STALE_WORKTREE_LOCK_AGE_SECS=0 left the effective threshold at ${effective}s, which switches the age proof off entirely"
+  pass "a zero staleness threshold is floored, so no env value can switch the age proof off"
+}
+
 # Teardown blocks in the foreground for this wait, so its ceiling must belong to
 # the code: a large threshold must not be able to stretch it into a long stall.
 test_judgeable_wait_cap_is_clamped_by_code_not_env() {
@@ -890,6 +917,7 @@ test_holder_probe_timeout_is_unknown
 test_holder_probe_missing_lsof_is_unknown
 test_provably_stale_only_when_both_proofs_hold
 test_junk_staleness_threshold_cannot_skip_the_age_proof
+test_zero_threshold_is_floored_not_accepted
 test_judgeable_wait_cap_is_clamped_by_code_not_env
 test_lock_path_ignores_ambient_git_env
 test_lock_path_rejects_a_foreign_resolution
